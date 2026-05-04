@@ -1,0 +1,10 @@
+---
+# playbooks/01_ocp_prereqs.yml
+# Creates namespace, SCC binding, service account, and Multus NADs.
+# Run once before any VM deployment.
+
+- name: OpenShift prerequisites
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: ocp_prereqs

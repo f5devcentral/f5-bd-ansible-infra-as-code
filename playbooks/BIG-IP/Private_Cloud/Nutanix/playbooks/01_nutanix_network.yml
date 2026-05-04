@@ -1,0 +1,11 @@
+---
+# playbooks/01_nutanix_network.yml
+# Creates VLAN-backed subnets in Prism Central for all four F5 networks.
+# Equivalent to OCP's 00_ocp_infra.yml (NMState operator + OVS bridge config).
+# Idempotent — skips any subnet that already exists.
+
+- name: Phase 1 — Create VLAN-backed subnets in Prism Central
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: nutanix_network

@@ -1,0 +1,35 @@
+---
+# Role: f5_wait_mgmt
+# No OCP API calls in this role — purely waiting on F5 management TCP/REST.
+# All tasks run on localhost (EE container) with direct HTTPS to F5 mgmt IP.
+
+- name: Wait for BIG-IP management HTTPS (port 443)
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[node_name].f5_mgmt_ip }}"
+    port: 443
+    delay: 30
+    timeout: 900
+    state: started
+
+- name: Poll BIG-IP iControl REST until device config is ready
+  ansible.builtin.uri:
+    url: "https://{{ hostvars[node_name].f5_mgmt_ip }}/mgmt/tm/sys/ready"
+    method: GET
+    user: admin
+    password: "{{ f5_admin_password }}"
+    validate_certs: false
+    status_code: [200]
+    return_content: true
+  register: bigip_ready
+  until: >
+    bigip_ready.status == 200 and
+    (bigip_ready.json.entries | default({}) | dict2items |
+     selectattr('value.nestedStats.entries.configReady.description', 'equalto', 'yes') |
+     list | length > 0)
+  retries: 40
+  delay: 30
+  no_log: true    # contains admin password
+
+- name: Confirm device is ready
+  ansible.builtin.debug:
+    msg: "{{ node_name }} ({{ hostvars[node_name].f5_mgmt_ip }}) is ready for onboarding"

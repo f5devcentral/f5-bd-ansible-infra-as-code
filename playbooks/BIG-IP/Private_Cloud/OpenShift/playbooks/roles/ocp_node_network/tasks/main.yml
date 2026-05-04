@@ -1,0 +1,75 @@
+---
+- name: Get worker node count
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+    label_selectors:
+      - node-role.kubernetes.io/worker
+  register: worker_nodes
+
+- name: Set worker count fact
+  ansible.builtin.set_fact:
+    worker_count: "{{ worker_nodes.resources | length }}"
+
+- name: Check if NNCP already exists
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: "{{ nmstate_bridge_name }}"
+  register: nncp_check
+
+- name: Check current NNCP condition
+  ansible.builtin.set_fact:
+    nncp_available: >-
+      {{
+        nncp_check.resources | length > 0 and
+        (nncp_check.resources[0].status.conditions | default([]) |
+         selectattr('type', 'equalto', 'Available') |
+         selectattr('status', 'equalto', 'True') |
+         list | length > 0)
+      }}
+
+- name: Apply NodeNetworkConfigurationPolicy
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', 'nncp.j2') | from_yaml }}"
+  when: not nncp_available
+
+- name: Wait for NNCP to reach Available
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationPolicy
+    name: "{{ nmstate_bridge_name }}"
+  register: nncp_status
+  until: >
+    nncp_status.resources | length > 0 and
+    (nncp_status.resources[0].status.conditions | default([]) |
+     selectattr('type', 'equalto', 'Available') |
+     selectattr('status', 'equalto', 'True') |
+     list | length > 0)
+  retries: 30
+  delay: 20
+  when: not nncp_available
+
+- name: Get NodeNetworkConfigurationEnactments
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NodeNetworkConfigurationEnactment
+    label_selectors:
+      - "nmstate.io/policy={{ nmstate_bridge_name }}"
+  register: nnce_status
+
+- name: Report per-node bridge status
+  ansible.builtin.debug:
+    msg: >
+      Node {{ item.metadata.name | regex_replace('\.' + nmstate_bridge_name, '') }}:
+      {{ item.status.conditions |
+         selectattr('type', 'equalto', 'Available') |
+         map(attribute='status') | first | default('Unknown') }}
+  loop: "{{ nnce_status.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: Confirm all worker bridges are ready
+  ansible.builtin.debug:
+    msg: "All {{ worker_count }} worker nodes have bridges for VLANs: {{ f5_networks | map(attribute='vlan_id') | list }}"

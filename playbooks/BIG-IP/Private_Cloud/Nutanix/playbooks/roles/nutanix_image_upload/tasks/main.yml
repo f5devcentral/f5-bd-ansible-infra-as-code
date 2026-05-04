@@ -1,0 +1,244 @@
+---
+# Role: nutanix_image_upload
+# Mounts CIFS share on bastion, caches DO RPM, then streams the QCOW2
+# directly to the Nutanix Image Service via Prism Central REST API.
+#
+# ntnx_images_v2 supports source_uri (HTTP/S URL) but NOT a local file path.
+# For CIFS-sourced images the upload must be a direct PUT to the image file
+# endpoint — this is done via curl streamed from the bastion, matching the
+# same pattern used in the OpenShift version's virtctl upload.
+#
+# Flow:
+#   1. Check if image already COMPLETE — skip entirely if so
+#   2. Mount CIFS on bastion, cache DO RPM
+#   3. Create image record via ntnx_images_v2 (state: present, no source_uri)
+#   4. Stream binary via curl PUT from bastion (async, same as OCP)
+#   5. Wait for image to reach COMPLETE state via ntnx_images_info_v2
+#
+# Idempotent — skips if image already COMPLETE.
+
+# ------------------------------------------------------------------
+# Check if image already exists and is COMPLETE
+# ------------------------------------------------------------------
+
+- name: Check if image already exists in Nutanix Image Service
+  block:
+
+    - name: Search for existing image by name
+      nutanix.ncp.ntnx_images_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ nutanix_image_name }}'"
+      register: image_info
+      no_log: true
+
+    - name: Set image upload needed fact
+      ansible.builtin.set_fact:
+        image_upload_needed: >-
+          {{
+            image_info.response | length == 0 or
+            (image_info.response |
+             selectattr('name', 'equalto', nutanix_image_name) |
+             selectattr('image_state', 'equalto', 'COMPLETE') |
+             list | length == 0)
+          }}
+        nutanix_image_ext_id: >-
+          {{
+            (image_info.response |
+             selectattr('name', 'equalto', nutanix_image_name) |
+             selectattr('image_state', 'equalto', 'COMPLETE') |
+             map(attribute='ext_id') | list | first)
+            if (image_info.response |
+                selectattr('name', 'equalto', nutanix_image_name) |
+                selectattr('image_state', 'equalto', 'COMPLETE') |
+                list | length > 0)
+            else ''
+          }}
+
+    - name: Report image status
+      ansible.builtin.debug:
+        msg: >-
+          Image '{{ nutanix_image_name }}':
+          {{ 'already COMPLETE — skipping upload (ext_id: ' + nutanix_image_ext_id + ')'
+             if not image_upload_needed
+             else 'not found or not COMPLETE — upload required' }}
+
+# ------------------------------------------------------------------
+# Upload block — skipped entirely if image already COMPLETE
+# ------------------------------------------------------------------
+
+- name: Image upload block
+  when: image_upload_needed
+  block:
+
+    # ------------------------------------------------------------------
+    # Bastion prerequisites
+    # ------------------------------------------------------------------
+
+    - name: Ensure cifs-utils is installed on bastion
+      ansible.builtin.package:
+        name: cifs-utils
+        state: present
+      become: true
+      delegate_to: bastion01
+
+    - name: Create CIFS mount point on bastion
+      ansible.builtin.file:
+        path: "{{ cifs_mountpoint }}"
+        state: directory
+        mode: '0755'
+      become: true
+      delegate_to: bastion01
+
+    - name: Mount CIFS share on bastion
+      ansible.posix.mount:
+        src: "{{ cifs_share }}"
+        path: "{{ cifs_mountpoint }}"
+        fstype: cifs
+        opts: "username={{ cifs_username }},password={{ cifs_password }},domain={{ cifs_domain }},uid=0,gid=0,file_mode=0644,dir_mode=0755"
+        state: mounted
+      become: true
+      delegate_to: bastion01
+
+    - name: Verify QCOW2 exists on share
+      ansible.builtin.stat:
+        path: "{{ cifs_mountpoint }}/{{ qcow2_filename }}"
+      register: qcow2_stat
+      delegate_to: bastion01
+      failed_when: not qcow2_stat.stat.exists
+
+    - name: Verify DO RPM exists on share
+      ansible.builtin.stat:
+        path: "{{ cifs_mountpoint }}/{{ do_filename }}"
+      register: do_rpm_stat
+      delegate_to: bastion01
+      failed_when:
+        - do_rpm_install_from_cifs | default(false) | bool
+        - not do_rpm_stat.stat.exists
+      when: do_rpm_install_from_cifs | default(false) | bool
+
+    # ------------------------------------------------------------------
+    # Cache DO RPM on bastion from CIFS (for f5_install_do role later)
+    # ------------------------------------------------------------------
+
+    - name: Create F5 cache directory on bastion
+      ansible.builtin.file:
+        path: "{{ bastion_f5_cache }}"
+        state: directory
+        mode: '0755'
+      become: true
+      delegate_to: bastion01
+      when: do_rpm_install_from_cifs | default(false) | bool
+
+    - name: Cache DO RPM on bastion from CIFS
+      ansible.builtin.copy:
+        src: "{{ cifs_mountpoint }}/{{ do_filename }}"
+        dest: "{{ bastion_f5_cache }}/{{ do_filename }}"
+        remote_src: true
+        mode: '0644'
+      delegate_to: bastion01
+      when: do_rpm_install_from_cifs | default(false) | bool
+
+    # ------------------------------------------------------------------
+    # Create image record in Nutanix Image Service
+    # ntnx_images_v2 creates the record; we then stream the binary separately.
+    # ------------------------------------------------------------------
+
+    - name: Create image record in Nutanix Image Service
+      nutanix.ncp.ntnx_images_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        state: present
+        name: "{{ nutanix_image_name }}"
+        description: "{{ nutanix_image_description }}"
+        type: DISK_IMAGE
+      register: image_create
+      no_log: true
+
+    - name: Cache new image ext_id
+      ansible.builtin.set_fact:
+        nutanix_image_ext_id: "{{ image_create.response.ext_id }}"
+
+    - name: Debug image ext_id
+      ansible.builtin.debug:
+        msg: "Created image record — ext_id: {{ nutanix_image_ext_id }}"
+
+    # ------------------------------------------------------------------
+    # Stream QCOW2 binary from bastion to Prism Central image upload endpoint.
+    # ntnx_images_v2 does not support local file path upload — the v4 API
+    # requires a PUT to /api/vmm/v4.0/content/images/{extId}/$actions/upload
+    # with the raw binary body. curl handles this from the bastion.
+    # Run async to avoid controller timeout on large images (~5+ GiB).
+    # ------------------------------------------------------------------
+
+    - name: Stream QCOW2 to Nutanix Image Service from bastion (async)
+      ansible.builtin.shell: >
+        curl -s -S
+        {{ '-k' if not nutanix_validate_certs else '' }}
+        -u "{{ nutanix_username }}:{{ nutanix_password }}"
+        -X PUT
+        -H "Content-Type: application/octet-stream"
+        --data-binary @{{ cifs_mountpoint }}/{{ qcow2_filename }}
+        "https://{{ nutanix_host }}:{{ nutanix_port }}/api/vmm/v4.0/content/images/{{ nutanix_image_ext_id }}/$actions/upload"
+      delegate_to: bastion01
+      async: 7200
+      poll: 0
+      register: upload_job
+      no_log: true
+
+    - name: Wait for QCOW2 upload to complete
+      ansible.builtin.async_status:
+        jid: "{{ upload_job.ansible_job_id }}"
+      register: upload_result
+      until: upload_result.finished
+      retries: 240
+      delay: 30
+      delegate_to: bastion01
+
+    - name: Fail if upload returned non-zero exit
+      ansible.builtin.fail:
+        msg: "Image upload failed: {{ upload_result.stderr | default('') }}"
+      when: upload_result.rc | default(0) != 0
+
+  always:
+    - name: Unmount CIFS share on bastion
+      ansible.posix.mount:
+        path: "{{ cifs_mountpoint }}"
+        state: unmounted
+      become: true
+      delegate_to: bastion01
+      when: cifs_mountpoint is defined
+
+# ------------------------------------------------------------------
+# Wait for image to reach COMPLETE state
+# ------------------------------------------------------------------
+
+- name: Wait for image to reach COMPLETE state
+  block:
+
+    - name: Poll image state until COMPLETE
+      nutanix.ncp.ntnx_images_info_v2:
+        ext_id: "{{ nutanix_image_ext_id }}"
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+      register: image_poll
+      until: >-
+        image_poll.response.image_state | default('') == 'COMPLETE'
+      retries: 60
+      delay: 30
+      no_log: true
+      failed_when: >-
+        image_poll.response.image_state | default('') == 'ERROR'
+
+    - name: Confirm image is COMPLETE
+      ansible.builtin.debug:
+        msg: "Image '{{ nutanix_image_name }}' is COMPLETE — ext_id: {{ nutanix_image_ext_id }}"

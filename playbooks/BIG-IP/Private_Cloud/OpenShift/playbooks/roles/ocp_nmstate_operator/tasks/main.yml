@@ -1,0 +1,128 @@
+---
+- name: Check if openshift-nmstate namespace exists
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: openshift-nmstate
+  register: nmstate_ns_check
+
+- name: Create openshift-nmstate namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: openshift-nmstate
+        labels:
+          kubernetes.io/metadata.name: openshift-nmstate
+  when: nmstate_ns_check.resources | length == 0
+
+- name: Check if NMState OperatorGroup exists
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    name: openshift-nmstate
+    namespace: openshift-nmstate
+  register: nmstate_og_check
+
+- name: Create NMState OperatorGroup
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: openshift-nmstate
+        namespace: openshift-nmstate
+      spec:
+        targetNamespaces:
+          - openshift-nmstate
+  when: nmstate_og_check.resources | length == 0
+
+- name: Check if NMState Subscription exists
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: kubernetes-nmstate-operator
+    namespace: openshift-nmstate
+  register: nmstate_sub_check
+
+- name: Create NMState Subscription
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: kubernetes-nmstate-operator
+        namespace: openshift-nmstate
+      spec:
+        channel: stable
+        installPlanApproval: Automatic
+        name: kubernetes-nmstate-operator
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+  when: nmstate_sub_check.resources | length == 0
+
+- name: Wait for NMState CSV to reach Succeeded
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: openshift-nmstate
+  register: nmstate_csv
+  until: >
+    nmstate_csv.resources |
+    selectattr('metadata.name', 'search', 'kubernetes-nmstate') |
+    selectattr('status.phase', 'equalto', 'Succeeded') |
+    list | length > 0
+  retries: 30
+  delay: 20
+
+- name: Check if NMState instance exists
+  kubernetes.core.k8s_info:
+    api_version: nmstate.io/v1
+    kind: NMState
+    name: nmstate
+  register: nmstate_instance_check
+
+- name: Create NMState instance
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: nmstate.io/v1
+      kind: NMState
+      metadata:
+        name: nmstate
+  when: nmstate_instance_check.resources | length == 0
+
+- name: Get worker node count
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+    label_selectors:
+      - node-role.kubernetes.io/worker
+  register: worker_nodes
+
+- name: Set expected handler count fact
+  ansible.builtin.set_fact:
+    expected_handler_count: "{{ worker_nodes.resources | length }}"
+
+- name: Wait for nmstate-handler pods on all nodes
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: openshift-nmstate
+    label_selectors:
+      - component=kubernetes-nmstate-handler
+  register: handler_pods
+  until: >
+    handler_pods.resources |
+    selectattr('status.phase', 'equalto', 'Running') |
+    list | length >= (expected_handler_count | int)
+  retries: 30
+  delay: 15
+
+- name: Confirm NMState handlers ready
+  ansible.builtin.debug:
+    msg: "NMState handlers running: {{ handler_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length }}/{{ expected_handler_count }}"

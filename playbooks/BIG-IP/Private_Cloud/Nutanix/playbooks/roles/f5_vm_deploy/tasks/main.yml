@@ -1,0 +1,283 @@
+---
+# Role: f5_vm_deploy (Nutanix — nutanix.ncp v2 modules)
+#
+# MINIMUM COLLECTION VERSION: nutanix.ncp >= 2.5.0
+# Install: ansible-galaxy collection install nutanix.ncp
+#
+# Resolves all required ext_ids (cluster, subnets, image), renders cloud-init
+# as a base64 string inline, then creates the VM via ntnx_vms_v2.
+# Idempotent — checks for existing VM by name before creating.
+#
+# ntnx_vms_v2 requires ext_id for cluster, subnets, and image — no name
+# resolution built in. All lookups re-use cached facts set by earlier roles
+# in the same play, falling back to fresh lookups if run standalone.
+
+# ------------------------------------------------------------------
+# Resolve cluster ext_id
+# Re-uses nutanix_cluster_ext_id cached by nutanix_prereqs if present.
+# ------------------------------------------------------------------
+
+- name: Resolve cluster ext_id (fresh lookup if not cached)
+  when: nutanix_cluster_ext_id is not defined
+  block:
+    - name: Look up cluster by name
+      nutanix.ncp.ntnx_clusters_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ nutanix_cluster_name }}'"
+      register: _cluster_lookup
+      no_log: true
+
+    - name: Fail if cluster not found
+      ansible.builtin.fail:
+        msg: "Cluster '{{ nutanix_cluster_name }}' not found in Prism Central."
+      when: _cluster_lookup.response | length == 0
+
+    - name: Cache cluster ext_id
+      ansible.builtin.set_fact:
+        nutanix_cluster_ext_id: "{{ _cluster_lookup.response[0].ext_id }}"
+
+# ------------------------------------------------------------------
+# Resolve subnet ext_ids
+# Re-uses nutanix_subnet_ext_ids dict cached by nutanix_network if present.
+# ------------------------------------------------------------------
+
+- name: Resolve subnet ext_ids (fresh lookup if not cached)
+  when: nutanix_subnet_ext_ids is not defined
+  block:
+    - name: Look up subnet ext_id — {{ item.subnet_name }}
+      nutanix.ncp.ntnx_subnets_info_v2:
+        filter: "name eq '{{ item.subnet_name }}'"
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+      register: _subnet_results
+      loop: "{{ f5_networks }}"
+      loop_control:
+        label: "{{ item.subnet_name }}"
+      no_log: true
+
+    - name: Fail if any subnet not found
+      ansible.builtin.fail:
+        msg: "Subnet '{{ item.item.subnet_name }}' not found. Run 01_nutanix_network.yml first."
+      when: item.response | length == 0
+      loop: "{{ _subnet_results.results }}"
+      loop_control:
+        label: "{{ item.item.subnet_name }}"
+
+    - name: Build subnet name to ext_id map
+      ansible.builtin.set_fact:
+        nutanix_subnet_ext_ids: >-
+          {{
+            nutanix_subnet_ext_ids | default({}) |
+            combine({ item.item.subnet_name: item.response[0].ext_id })
+          }}
+      loop: "{{ _subnet_results.results }}"
+      loop_control:
+        label: "{{ item.item.subnet_name }}"
+
+# ------------------------------------------------------------------
+# Resolve image ext_id
+# Re-uses nutanix_image_ext_id cached by nutanix_image_upload if present.
+# ------------------------------------------------------------------
+
+- name: Resolve image ext_id (fresh lookup if not cached)
+  when: nutanix_image_ext_id is not defined
+  block:
+    - name: Look up image by name
+      nutanix.ncp.ntnx_images_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ nutanix_image_name }}'"
+      register: _image_lookup
+      no_log: true
+
+    - name: Fail if image not found or not COMPLETE
+      ansible.builtin.fail:
+        msg: "Image '{{ nutanix_image_name }}' not found or not COMPLETE. Run 02_image_upload.yml first."
+      when: >-
+        _image_lookup.response | length == 0 or
+        (_image_lookup.response |
+         selectattr('image_state', 'equalto', 'COMPLETE') |
+         list | length == 0)
+
+    - name: Cache image ext_id
+      ansible.builtin.set_fact:
+        nutanix_image_ext_id: >-
+          {{
+            _image_lookup.response |
+            selectattr('image_state', 'equalto', 'COMPLETE') |
+            map(attribute='ext_id') | first
+          }}
+
+# ------------------------------------------------------------------
+# Build NIC list from f5_networks + resolved subnet ext_ids.
+# ntnx_vms_v2 nics format (confirmed from official issue #578):
+#   nics:
+#     - network_info:
+#         subnet:
+#           ext_id: "<uuid>"
+# NIC order matches f5_networks list order: mgmt, internal, external, ha.
+# ------------------------------------------------------------------
+
+- name: Build NIC list for VM spec
+  ansible.builtin.set_fact:
+    _vm_nics: >-
+      {{
+        _vm_nics | default([]) +
+        [{
+          'network_info': {
+            'subnet': {
+              'ext_id': nutanix_subnet_ext_ids[item.subnet_name]
+            }
+          }
+        }]
+      }}
+  loop: "{{ f5_networks }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.subnet_name }})"
+
+# ------------------------------------------------------------------
+# Check if VM already exists
+# ------------------------------------------------------------------
+
+- name: Check if VM already exists
+  block:
+    - name: Search for VM by name
+      nutanix.ncp.ntnx_vms_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ node_name }}'"
+      register: _vm_check
+      no_log: true
+
+    - name: Set VM exists fact
+      ansible.builtin.set_fact:
+        _vm_exists: >-
+          {{
+            _vm_check.response |
+            selectattr('name', 'equalto', node_name) |
+            list | length > 0
+          }}
+
+    - name: Report VM status
+      ansible.builtin.debug:
+        msg: "VM '{{ node_name }}': {{ 'already exists — skipping creation' if _vm_exists else 'not found — will create' }}"
+
+# ------------------------------------------------------------------
+# Render cloud-init and create VM
+# ------------------------------------------------------------------
+
+- name: Create VM block
+  when: not _vm_exists
+  block:
+
+    # Render cloud-init and base64-encode inline.
+    # ntnx_vms_v2 guest_customization.config.cloudinit.cloud_init_script
+    # .user_data.value expects a base64-encoded cloud-config string.
+    - name: Render and encode cloud-init user-data for {{ node_name }}
+      ansible.builtin.set_fact:
+        _cloudinit_b64: "{{ lookup('template', 'cloudinit_userdata.j2') | b64encode }}"
+      no_log: true
+
+    - name: Create VM — {{ node_name }}
+      nutanix.ncp.ntnx_vms_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        state: present
+        name: "{{ node_name }}"
+        description: "F5 BIG-IP HA — {{ 'primary' if node_name == f5_primary_node else 'secondary' }}"
+        num_sockets: "{{ f5_vm_num_sockets }}"
+        num_cores_per_socket: "{{ f5_vm_cores_per_socket }}"
+        memory_size_bytes: "{{ f5_vm_memory_gb | int * 1024 * 1024 * 1024 }}"
+        cluster:
+          ext_id: "{{ nutanix_cluster_ext_id }}"
+        nics: "{{ _vm_nics }}"
+        disks:
+          - backing_info:
+              vm_disk:
+                disk_size_bytes: "{{ f5_disk_size_gb | int * 1024 * 1024 * 1024 }}"
+                data_source:
+                  reference:
+                    image_reference:
+                      image_ext_id: "{{ nutanix_image_ext_id }}"
+        guest_customization:
+          config:
+            cloudinit:
+              datasource_type: CONFIG_DRIVE_V2
+              cloud_init_script:
+                user_data:
+                  value: "{{ _cloudinit_b64 }}"
+      register: _vm_create
+      no_log: true
+
+    - name: Confirm VM created
+      ansible.builtin.debug:
+        msg: "VM '{{ node_name }}' created — ext_id: {{ _vm_create.response.ext_id }}"
+
+# ------------------------------------------------------------------
+# Resolve VM ext_id (whether just created or pre-existing)
+# then wait for POWERED_ON state.
+# ------------------------------------------------------------------
+
+- name: Resolve VM ext_id and wait for power on
+  block:
+
+    - name: Look up VM ext_id by name
+      nutanix.ncp.ntnx_vms_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ node_name }}'"
+      register: _vm_final
+      until: >-
+        _vm_final.response |
+        selectattr('name', 'equalto', node_name) |
+        list | length > 0
+      retries: 10
+      delay: 10
+      no_log: true
+
+    - name: Set VM ext_id fact
+      ansible.builtin.set_fact:
+        _vm_ext_id: >-
+          {{
+            _vm_final.response |
+            selectattr('name', 'equalto', node_name) |
+            map(attribute='ext_id') | first
+          }}
+
+    - name: Poll VM power state until ON
+      nutanix.ncp.ntnx_vms_info_v2:
+        ext_id: "{{ _vm_ext_id }}"
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+      register: _vm_power_poll
+      until: >-
+        _vm_power_poll.response.power_state | default('') == 'ON'
+      retries: 40
+      delay: 15
+      no_log: true
+
+    - name: Confirm VM is powered on
+      ansible.builtin.debug:
+        msg: "VM '{{ node_name }}' ({{ _vm_ext_id }}) is POWERED_ON ✓"

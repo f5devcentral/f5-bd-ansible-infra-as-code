@@ -1,0 +1,37 @@
+{# templates/cloudinit_userdata.j2 #}
+{# Rendered per-node — hostvars[node_name] provides per-node vars. #}
+{# Identical to the OpenShift version — cloud-init is platform-agnostic. #}
+#cloud-config
+write_files:
+  - path: /config/startup-mgmt.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "Waiting for MCP to be ready..."
+      until tmsh show sys mcp-state field-fmt 2>/dev/null | grep -q "phase running"; do
+        sleep 5
+      done
+      echo "MCP ready at $(date)"
+
+      tmsh modify sys global-settings mgmt-dhcp disabled
+      tmsh create sys management-ip {{ hostvars[node_name].f5_mgmt_ip }}/{{ f5_mgmt_prefix }} || \
+        tmsh modify sys management-ip {{ hostvars[node_name].f5_mgmt_ip }}/{{ f5_mgmt_prefix }}
+      tmsh create sys management-route default gateway {{ f5_mgmt_gateway }} || \
+        tmsh modify sys management-route default gateway {{ f5_mgmt_gateway }}
+      tmsh modify sys global-settings hostname {{ hostvars[node_name].f5_hostname }}
+      tmsh modify sys dns name-servers replace-all-with { {{ f5_dns_servers | join(' ') }} }
+      tmsh modify sys dns search replace-all-with { {{ f5_dns_search | join(' ') }} }
+      tmsh modify sys ntp servers replace-all-with { {{ f5_ntp_servers | join(' ') }} }
+      tmsh modify sys ntp timezone {{ f5_timezone }}
+      tmsh save sys config
+
+      echo "Done at $(date)"
+
+runcmd:
+  - /config/startup-mgmt.sh >> /var/log/startup-mgmt.log 2>&1 &
+
+chpasswd:
+  list: |
+    root:{{ f5_root_password }}
+    admin:{{ f5_admin_password }}
+  expire: False

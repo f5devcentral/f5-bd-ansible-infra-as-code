@@ -1,0 +1,10 @@
+---
+# playbooks/02_image_upload.yml
+# Mounts CIFS on bastion, streams QCOW2 to CDI upload proxy.
+# Idempotent — skips if DataVolume already Succeeded.
+
+- name: Upload F5 QCOW2 image to OpenShift CDI
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: f5_image_upload

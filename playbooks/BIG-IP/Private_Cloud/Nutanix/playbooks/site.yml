@@ -1,0 +1,20 @@
+---
+# site.yml — master playbook
+# Runs all phases in order.
+# In AAP, create a Job Template pointing at this playbook.
+# Individual playbooks can also be run standalone for re-runs / debugging.
+
+- name: Phase 0 — Nutanix prerequisites and preflight checks
+  ansible.builtin.import_playbook: 00_nutanix_prereqs.yml
+
+- name: Phase 1 — Create VLAN-backed subnets in Prism Central
+  ansible.builtin.import_playbook: 01_nutanix_network.yml
+
+- name: Phase 2 — Upload F5 QCOW2 image to Nutanix Image Service
+  ansible.builtin.import_playbook: 02_image_upload.yml
+
+- name: Phase 3 — Deploy VirtualMachines on AHV
+  ansible.builtin.import_playbook: 03_deploy_vm.yml
+
+- name: Phase 4 — Declarative Onboarding
+  ansible.builtin.import_playbook: 04_onboard.yml

@@ -1,0 +1,142 @@
+{# templates/do_declaration.j2 #}
+{# Rendered per-node. Handles full network config + HA for active/standby. #}
+{
+  "schemaVersion": "1.0.0",
+  "class": "Device",
+  "async": true,
+  "label": "{{ hostvars[node_name].f5_hostname }} onboarding",
+
+  "Common": {
+    "class": "Tenant",
+
+    "myLicense": {
+      "class": "License",
+      "licenseType": "licensePool",
+      "bigIqHost": "{{ bigiq_host }}",
+      "bigIqUsername": "{{ bigiq_username }}",
+      "bigIqPassword": "{{ bigiq_password }}",
+      "licensePool": "{{ bigiq_pool }}",
+      "reachable": true,
+      "bigIpUsername": "admin",
+      "bigIpPassword": "{{ f5_admin_password }}",
+      "overwrite": true
+    },
+
+    "myDns": {
+      "class": "DNS",
+      "nameServers": {{ f5_dns_servers | to_json }},
+      "search": {{ f5_dns_search | to_json }}
+    },
+
+    "myNtp": {
+      "class": "NTP",
+      "servers": {{ f5_ntp_servers | to_json }},
+      "timezone": "{{ f5_timezone }}"
+    },
+
+    "mySystem": {
+      "class": "System",
+      "hostname": "{{ hostvars[node_name].f5_hostname }}",
+      "cliInactivityTimeout": 1200
+    },
+
+    "vlan-internal": {
+      "class": "VLAN",
+      "tag": 3010,
+      "mtu": 1500,
+      "interfaces": [{ "name": "1.1", "tagged": false }]
+    },
+
+    "vlan-external": {
+      "class": "VLAN",
+      "tag": 3011,
+      "mtu": 1500,
+      "interfaces": [{ "name": "1.2", "tagged": false }]
+    },
+
+    "vlan-ha": {
+      "class": "VLAN",
+      "tag": 3012,
+      "mtu": 1500,
+      "interfaces": [{ "name": "1.3", "tagged": false }]
+    },
+
+    "self-internal": {
+      "class": "SelfIp",
+      "address": "{{ hostvars[node_name].f5_self_internal }}",
+      "vlan": "vlan-internal",
+      "allowService": "default",
+      "trafficGroup": "traffic-group-local-only"
+    },
+
+    "self-internal-float": {
+      "class": "SelfIp",
+      "address": "{{ f5_float_internal }}",
+      "vlan": "vlan-internal",
+      "allowService": "default",
+      "trafficGroup": "traffic-group-1"
+    },
+
+    "self-external": {
+      "class": "SelfIp",
+      "address": "{{ hostvars[node_name].f5_self_external }}",
+      "vlan": "vlan-external",
+      "allowService": "none",
+      "trafficGroup": "traffic-group-local-only"
+    },
+
+    "self-external-float": {
+      "class": "SelfIp",
+      "address": "{{ f5_float_external }}",
+      "vlan": "vlan-external",
+      "allowService": "none",
+      "trafficGroup": "traffic-group-1"
+    },
+
+    "self-ha": {
+      "class": "SelfIp",
+      "address": "{{ hostvars[node_name].f5_self_ha }}",
+      "vlan": "vlan-ha",
+      "allowService": "default",
+      "trafficGroup": "traffic-group-local-only"
+    },
+
+    "myConfigSync": {
+      "class": "ConfigSync",
+      "configsyncIp": "{{ hostvars[node_name].f5_self_ha | ansible.utils.ipaddr('address') }}"
+    },
+
+    "myFailoverUnicast": {
+      "class": "FailoverUnicast",
+      "address": "{{ hostvars[node_name].f5_self_ha | ansible.utils.ipaddr('address') }}"
+    },
+
+    "myMirror": {
+      "class": "MirrorIp",
+      "primaryIp": "{{ hostvars[node_name].f5_self_ha | ansible.utils.ipaddr('address') }}"
+    },
+
+    "myDeviceGroup": {
+      "class": "DeviceGroup",
+      "type": "sync-failover",
+      "members": [
+        "{{ hostvars[f5_primary_node].f5_mgmt_ip }}",
+        "{{ hostvars[f5_secondary_node].f5_mgmt_ip }}"
+      ],
+      "owner": "/Common/myDeviceGroup/members/0",
+      "autoSync": true,
+      "fullLoadOnSync": false,
+      "asmSync": false,
+      "networkFailover": true
+    },
+
+    "myDeviceTrust": {
+      "class": "DeviceTrust",
+      "localUsername": "admin",
+      "localPassword": "{{ f5_admin_password }}",
+      "remoteHost": "/Common/myDeviceGroup/members/0",
+      "remoteUsername": "admin",
+      "remotePassword": "{{ f5_admin_password }}"
+    }
+  }
+}

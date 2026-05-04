@@ -1,0 +1,39 @@
+---
+- name: Find latest F5 BIG-IP VE AMI
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  # vars:
+  #   region: us-east-1
+  #   bigip_version: "17.1"          # target version (major.minor.patch)
+  #   bigip_features: "Best"       # Good Better Best
+  #   bigip_bandwidth: "25M"       # 25M 1G 3G 5G 10G
+  #   license_type: "PAYG"         # "PAYG" or "BYOL"
+  #   instance_type: "m5.xlarge"
+
+  tasks:
+    - name: Get list of official F5 BIG-IP AMIs
+      amazon.aws.ec2_ami_info:
+        # aws_access_key: "{{ AWS_ACCESS_KEY_ID }}"
+        # aws_secret_key: "{{ AWS_SECRET_ACCESS_KEY }}"
+        region: "{{ region }}"
+        owners: ["679593333241"]
+        filters:
+          name: "*BIGIP*{{ bigip_version }}*{{ license_type }}*{{ bigip_features }}*{{ bigip_bandwidth }}*"
+      register: f5_amis
+
+    - name: Sort AMIs by CreationDate (latest first)
+      ansible.builtin.set_fact:
+        latest_ami: "{{ f5_amis.images | sort(attribute='creation_date', reverse=True) | first }}"
+
+    - name: Show latest BIG-IP AMI info
+      ansible.builtin.debug:
+        msg:
+          - "Region: {{ region }}"
+          - "Version: {{ bigip_version }}"
+          - "License Type: {{ license_type }}"
+          - "Latest AMI Name: {{ latest_ami.name }}"
+          - "AMI ID: {{ latest_ami.image_id }}"
+          - "Creation Date: {{ latest_ami.creation_date }}"
+          # - "Instance Type: {{ instance_type }}"

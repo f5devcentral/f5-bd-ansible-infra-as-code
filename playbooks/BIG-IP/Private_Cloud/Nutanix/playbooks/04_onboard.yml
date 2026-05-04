@@ -1,0 +1,69 @@
+---
+# playbooks/04_onboard.yml
+# Identical flow to OpenShift — F5 onboarding is fully platform-agnostic.
+
+- name: Wait for both BIG-IP nodes to be ready
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Wait for primary management interface
+      ansible.builtin.include_role:
+        name: f5_wait_mgmt
+      vars:
+        node_name: "{{ f5_primary_node }}"
+
+    - name: Wait for secondary management interface
+      ansible.builtin.include_role:
+        name: f5_wait_mgmt
+      vars:
+        node_name: "{{ f5_secondary_node }}"
+
+- name: Install DO RPM on both nodes
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Install DO on primary
+      ansible.builtin.include_role:
+        name: f5_install_do
+      vars:
+        node_name: "{{ f5_primary_node }}"
+
+    - name: Install DO on secondary
+      ansible.builtin.include_role:
+        name: f5_install_do
+      vars:
+        node_name: "{{ f5_secondary_node }}"
+
+    - name: Clean up DO RPM from bastion cache
+      ansible.builtin.file:
+        path: "{{ bastion_f5_cache }}/{{ do_filename }}"
+        state: absent
+      delegate_to: bastion01
+      become: true
+      when:
+        - do_rpm_install_from_cifs | default(false) | bool
+        - do_install_success | default(false) | bool
+
+- name: Onboard primary node first
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run Declarative Onboarding on primary
+      ansible.builtin.include_role:
+        name: f5_declarative_onboarding
+      vars:
+        node_name: "{{ f5_primary_node }}"
+
+- name: Onboard secondary node after primary completes
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run Declarative Onboarding on secondary
+      ansible.builtin.include_role:
+        name: f5_declarative_onboarding
+      vars:
+        node_name: "{{ f5_secondary_node }}"

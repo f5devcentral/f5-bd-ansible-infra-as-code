@@ -1,0 +1,150 @@
+---
+# ============================================================
+# Nutanix Prism Central
+# ============================================================
+# Auth is NOT set here for production use.
+# AAP injects credentials at runtime via a Custom Credential Type.
+# Recommended env-var pattern — map these in the AAP credential:
+#   NUTANIX_HOST     → Prism Central FQDN / IP
+#   NUTANIX_USERNAME → Prism Central admin user
+#   NUTANIX_PASSWORD → Prism Central admin password
+#
+# All nutanix.ncp v2 module tasks read these vars automatically
+# when set via module_defaults in the playbook group.
+
+nutanix_host: "prism-central.yourdomain.local"   # update to your PC FQDN/IP
+nutanix_port: 9440
+nutanix_username: "{{ vault_nutanix_username }}"
+nutanix_password: "{{ vault_nutanix_password }}"
+nutanix_validate_certs: false
+
+# Prism Central cluster name — used to look up cluster ext_id at runtime.
+# Run 'ntnx_clusters_info_v2' to list available clusters.
+nutanix_cluster_name: "your-ahv-cluster"          # update to your cluster name
+
+# ============================================================
+# CIFS share (mount delegated to bastion)
+# ============================================================
+cifs_share: "//fileserver.yourdomain.local/images"
+cifs_mountpoint: "/mnt/f5images"
+cifs_username: "{{ vault_cifs_username }}"
+cifs_password: "{{ vault_cifs_password }}"
+cifs_domain: "YOURDOMAIN"
+qcow2_filename: "BIGIP-17.5.1.5-0.0.6.qcow2"    # update to your image filename
+do_rpm_install_from_cifs: true
+do_filename: "f5-declarative-onboarding-1.48.0-3.noarch.rpm"
+bastion_f5_cache: "/opt/f5/cache"
+
+# ============================================================
+# Nutanix Image Service
+# ============================================================
+# One image upload serves both nodes — Nutanix clones at VM creation time.
+# Idempotent — skips upload if image already exists and is COMPLETE.
+nutanix_image_name: "f5-bigip-17.5.1"
+nutanix_image_description: "F5 BIG-IP QCOW2 for HA pair deployment"
+
+# ============================================================
+# VM compute spec
+# ============================================================
+f5_vm_num_sockets: 1
+f5_vm_cores_per_socket: 4
+f5_vm_memory_gb: 16              # converted to bytes in the role
+
+# Boot disk size in GiB (cloned from uploaded image then expanded)
+f5_disk_size_gb: 120
+
+# ============================================================
+# Network — VLANs and Nutanix subnet mapping
+# ============================================================
+# Each entry maps a BIG-IP network role to a Nutanix VLAN subnet.
+# subnet_name must be unique per VLAN — this is what gets created
+# in Prism Central by the nutanix_network role (Phase 0) and then
+# referenced by name during VM NIC attachment.
+#
+# virtual_switch: the AHV virtual switch to create the subnet on.
+# Default on most AHV clusters is 'vs0'. Only needed at subnet creation
+# time — VMs reference subnets by ext_id, not the switch directly.
+#
+# NIC order in the VM spec matches this list exactly:
+#   NIC 0 = mgmt     (VLAN 3014)
+#   NIC 1 = internal (VLAN 3010)
+#   NIC 2 = external (VLAN 3011)
+#   NIC 3 = ha       (VLAN 3012)
+
+f5_networks:
+  - name: mgmt
+    vlan_id: 3014
+    subnet_name: "f5-mgmt"
+    bigip_iface: "mgmt"
+    virtual_switch: "vs0"
+  - name: internal
+    vlan_id: 3010
+    subnet_name: "f5-internal"
+    bigip_iface: "1.1"
+    virtual_switch: "vs0"
+  - name: external
+    vlan_id: 3011
+    subnet_name: "f5-external"
+    bigip_iface: "1.2"
+    virtual_switch: "vs0"
+  - name: ha
+    vlan_id: 3012
+    subnet_name: "f5-ha"
+    bigip_iface: "1.3"
+    virtual_switch: "vs0"
+
+# Floating (shared) IPs — only on internal and external
+f5_float_internal: "10.30.10.10/24"
+f5_float_external: "10.30.11.10/24"
+
+# Default gateway (management plane)
+f5_mgmt_gateway: "10.30.14.1"
+f5_mgmt_prefix: "24"
+
+# ============================================================
+# DNS / NTP
+# ============================================================
+f5_dns_servers:
+  - "192.168.10.10"
+  - "192.168.10.11"
+f5_dns_search:
+  - "yourdomain.local"
+f5_ntp_servers:
+  - "192.168.10.20"
+  - "pool.ntp.org"
+f5_timezone: "America/New_York"
+
+# ============================================================
+# F5 credentials
+# ============================================================
+f5_admin_password: "{{ lookup('env', 'ANSIBLE_NET_PASSWORD') }}"
+f5_root_password: "{{ lookup('env', 'ANSIBLE_NET_PASSWORD') }}"
+
+# ============================================================
+# F5 licensing
+# ============================================================
+# variable answer can be regkey or bigiq
+f5_license_type: regkey
+
+# regKey licensing
+f5_license_key_node1: "XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX"
+f5_license_key_node2: "XXXXX-XXXXX-XXXXX-XXXXX-XXXXXXX"
+
+# bigiq licensing
+bigiq_host: "192.168.1.100"
+bigiq_username: "{{ biq_username }}"
+bigiq_password: "{{ biq_password }}"
+bigiq_pool: "biq_pool_name"
+
+# ============================================================
+# Declarative Onboarding
+# ============================================================
+do_poll_interval: 30
+do_poll_retries: 40
+
+# ============================================================
+# HA
+# ============================================================
+f5_ha_enabled: true
+f5_primary_node: "bigip-01"
+f5_secondary_node: "bigip-02"

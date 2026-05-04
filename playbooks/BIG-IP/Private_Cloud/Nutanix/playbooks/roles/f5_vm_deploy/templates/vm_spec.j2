@@ -1,0 +1,66 @@
+{# templates/vm_spec.j2 #}
+{# Rendered per-node. Produces the Prism Central v3 VM create body. #}
+{# NICs are ordered to match f5_networks: mgmt first, then internal/external/ha #}
+{
+  "spec": {
+    "name": "{{ node_name }}",
+    "description": "F5 BIG-IP HA node — {{ 'primary' if node_name == f5_primary_node else 'secondary' }}",
+    "resources": {
+      "power_state": "ON",
+      "num_vcpus_per_socket": {{ f5_vm_cpu_cores_per_socket }},
+      "num_sockets": {{ f5_vm_cpu_sockets }},
+      "memory_size_mib": {{ f5_vm_memory_mib }},
+
+      "disk_list": [
+        {
+          "device_properties": {
+            "device_type": "DISK",
+            "disk_address": {
+              "adapter_type": "SCSI",
+              "device_index": 0
+            }
+          },
+          "data_source_reference": {
+            "kind": "image",
+            "uuid": "{{ nutanix_image_uuid }}"
+          },
+          "disk_size_mib": {{ f5_disk_size_gib * 1024 }}
+        }
+      ],
+
+      "nic_list": [
+{% for net in f5_networks %}
+        {
+          "nic_type": "NORMAL_NIC",
+          "vlan_mode": "ACCESS",
+          "subnet_reference": {
+            "kind": "subnet",
+            "uuid": "{{ nutanix_subnet_map[net.subnet_name] }}"
+          },
+          "is_connected": true
+        }{{ "," if not loop.last else "" }}
+{% endfor %}
+      ],
+
+      "guest_customization": {
+        "cloud_init": {
+          "user_data": "{{ cloudinit_userdata | b64encode }}"
+        }
+      }
+    },
+
+    "cluster_reference": {
+      "kind": "cluster",
+      "uuid": "{{ nutanix_cluster_uuid }}"
+    }
+  },
+
+  "metadata": {
+    "kind": "vm",
+    "spec_version": 0,
+    "categories": {
+      "AppType": "F5-BIG-IP",
+      "AppTier": "{{ 'Primary' if node_name == f5_primary_node else 'Secondary' }}"
+    }
+  }
+}

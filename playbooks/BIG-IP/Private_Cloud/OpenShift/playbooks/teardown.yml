@@ -1,0 +1,545 @@
+---
+# playbooks/teardown.yml
+# Removes all F5 BIG-IP resources from OpenShift in reverse order.
+# Safe to run at any stage — checks existence before every delete
+# so it skips gracefully if a resource was never created.
+#
+# Safety flags (all default false — must be explicitly set):
+#   delete_disk_images: true    → removes per-node DataVolumes (uploaded disk images)
+#                                 NOTE: old variable name 'delete_source_image' is no longer supported
+#   delete_namespace: true      → removes the entire namespace at the end
+#   delete_node_network: true   → removes the NNCP/OVS bridge config + forces bridge cleanup
+#   delete_nmstate: true        → removes the NMState operator entirely
+#   bigiq_revoke_on_teardown: true → revokes BIG-IQ licenses before VM deletion
+
+- name: Teardown F5 BIG-IP deployment
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    # ------------------------------------------------------------------
+    # Revoke BIG-IQ licenses
+    # Must run before VM deletion — BIG-IP must still be reachable
+    # ------------------------------------------------------------------
+
+    - name: Revoke license for primary from BIG-IQ
+      ansible.builtin.uri:
+        url: "https://{{ bigiq_host }}/mgmt/cm/device/tasks/licensing/pool/member-management"
+        method: POST
+        body_format: json
+        body:
+          address: "{{ hostvars[f5_primary_node].f5_mgmt_ip }}"
+          assignmentType: "unmanaged"
+          command: "revoke"
+          licensePoolName: "{{ bigiq_pool }}"
+          password: "{{ f5_admin_password }}"
+          user: "admin"
+        return_content: true
+        status_code: [200, 202]
+        force_basic_auth: true
+        user: "{{ bigiq_username }}"
+        password: "{{ bigiq_password }}"
+        validate_certs: false
+      delegate_to: localhost
+      no_log: true
+      when: bigiq_revoke_on_teardown | default(false) | bool
+      failed_when: false
+
+    - name: Revoke license for secondary from BIG-IQ
+      ansible.builtin.uri:
+        url: "https://{{ bigiq_host }}/mgmt/cm/device/tasks/licensing/pool/member-management"
+        method: POST
+        body_format: json
+        body:
+          address: "{{ hostvars[f5_secondary_node].f5_mgmt_ip }}"
+          assignmentType: "unmanaged"
+          command: "revoke"
+          licensePoolName: "{{ bigiq_pool }}"
+          password: "{{ f5_admin_password }}"
+          user: "admin"
+        return_content: true
+        status_code: [200, 202]
+        force_basic_auth: true
+        user: "{{ bigiq_username }}"
+        password: "{{ bigiq_password }}"
+        validate_certs: false
+      delegate_to: localhost
+      no_log: true
+      when: bigiq_revoke_on_teardown | default(false) | bool
+      failed_when: false
+
+    - name: Report license revocation status
+      ansible.builtin.debug:
+        msg: "BIG-IQ license revocation: {{ 'completed' if (bigiq_revoke_on_teardown | default(false) | bool) else 'skipped (bigiq_revoke_on_teardown=false)' }}"
+
+    # ------------------------------------------------------------------
+    # VirtualMachines
+    # ------------------------------------------------------------------
+
+    - name: Check if primary VM exists
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: vm_primary_check
+
+    - name: Delete primary VM
+      kubernetes.core.k8s:
+        state: absent
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      when: vm_primary_check.resources | length > 0
+
+    - name: Check if secondary VM exists
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: vm_secondary_check
+
+    - name: Delete secondary VM
+      kubernetes.core.k8s:
+        state: absent
+        api_version: kubevirt.io/v1
+        kind: VirtualMachine
+        name: "{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      when: vm_secondary_check.resources | length > 0
+
+    - name: Wait for primary VMI to terminate
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: vmi_primary
+      until: vmi_primary.resources | length == 0
+      retries: 20
+      delay: 15
+      when: vm_primary_check.resources | length > 0
+
+    - name: Wait for secondary VMI to terminate
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: vmi_secondary
+      until: vmi_secondary.resources | length == 0
+      retries: 20
+      delay: 15
+      when: vm_secondary_check.resources | length > 0
+
+    - name: Report VM status
+      ansible.builtin.debug:
+        msg: >
+          VMs:
+          primary={{ 'deleted' if vm_primary_check.resources | length > 0 else 'not found - skipped' }},
+          secondary={{ 'deleted' if vm_secondary_check.resources | length > 0 else 'not found - skipped' }}
+
+    # ------------------------------------------------------------------
+    # cloud-init secrets
+    # ------------------------------------------------------------------
+
+    - name: Check if primary cloud-init secret exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "cloudinit-{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: secret_primary_check
+
+    - name: Delete primary cloud-init secret
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "cloudinit-{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      when: secret_primary_check.resources | length > 0
+
+    - name: Check if secondary cloud-init secret exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: "cloudinit-{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: secret_secondary_check
+
+    - name: Delete secondary cloud-init secret
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "cloudinit-{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      when: secret_secondary_check.resources | length > 0
+
+    - name: Report cloud-init secret status
+      ansible.builtin.debug:
+        msg: >
+          cloud-init secrets:
+          primary={{ 'deleted' if secret_primary_check.resources | length > 0 else 'not found - skipped' }},
+          secondary={{ 'deleted' if secret_secondary_check.resources | length > 0 else 'not found - skipped' }}
+
+    # ------------------------------------------------------------------
+    # Per-node DataVolumes (uploaded disk images)
+    # Only removed if delete_disk_images: true — defaults to false
+    # so you can redeploy without re-uploading the images.
+    # NOTE: old variable 'delete_source_image' is no longer supported.
+    # ------------------------------------------------------------------
+
+    - name: Warn if deprecated delete_source_image variable is set
+      ansible.builtin.debug:
+        msg: >
+          WARNING: 'delete_source_image' is deprecated and no longer supported.
+          Use 'delete_disk_images: true' instead. DataVolumes will NOT be deleted.
+      when: delete_source_image is defined
+
+    - name: Check if primary DataVolume exists
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        name: "{{ f5_datavolume_name }}-{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: dv_primary_check
+      when: delete_disk_images | default(false) | bool
+
+    - name: Delete primary DataVolume
+      kubernetes.core.k8s:
+        state: absent
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        name: "{{ f5_datavolume_name }}-{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      when:
+        - delete_disk_images | default(false) | bool
+        - dv_primary_check.resources | length > 0
+
+    - name: Check if secondary DataVolume exists
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        name: "{{ f5_datavolume_name }}-{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: dv_secondary_check
+      when: delete_disk_images | default(false) | bool
+
+    - name: Delete secondary DataVolume
+      kubernetes.core.k8s:
+        state: absent
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        name: "{{ f5_datavolume_name }}-{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      when:
+        - delete_disk_images | default(false) | bool
+        - dv_secondary_check.resources | length > 0
+
+    - name: Report DataVolume status
+      ansible.builtin.debug:
+        msg: >
+          DataVolumes:
+          {% if not (delete_disk_images | default(false) | bool) %}
+          retained (delete_disk_images=false)
+          {% else %}
+          primary={{ 'deleted' if dv_primary_check.resources | length > 0 else 'not found - skipped' }},
+          secondary={{ 'deleted' if dv_secondary_check.resources | length > 0 else 'not found - skipped' }}
+          {% endif %}
+
+    # ------------------------------------------------------------------
+    # Multus NetworkAttachmentDefinitions
+    # ------------------------------------------------------------------
+
+    - name: Check which NADs exist
+      kubernetes.core.k8s_info:
+        api_version: k8s.cni.cncf.io/v1
+        kind: NetworkAttachmentDefinition
+        name: "{{ nad_item.nad_name }}"
+        namespace: "{{ ocp_namespace }}"
+      register: nad_check
+      loop: "{{ f5_networks }}"
+      loop_control:
+        loop_var: nad_item
+        label: "{{ nad_item.name }}"
+
+    - name: Delete existing NADs
+      kubernetes.core.k8s:
+        state: absent
+        api_version: k8s.cni.cncf.io/v1
+        kind: NetworkAttachmentDefinition
+        name: "{{ item.nad_item.nad_name }}"
+        namespace: "{{ ocp_namespace }}"
+      loop: "{{ nad_check.results }}"
+      loop_control:
+        label: "{{ item.nad_item.name }}"
+      when: item.resources | length > 0
+
+    - name: Report NAD status
+      ansible.builtin.debug:
+        msg: >
+          NAD {{ item.nad_item.name }}:
+          {{ 'deleted' if item.resources | length > 0 else 'not found - skipped' }}
+      loop: "{{ nad_check.results }}"
+      loop_control:
+        label: "{{ item.nad_item.name }}"
+
+    # ------------------------------------------------------------------
+    # SCC ClusterRoleBinding
+    # ------------------------------------------------------------------
+
+    - name: Check if SCC ClusterRoleBinding exists
+      kubernetes.core.k8s_info:
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        name: "f5-bigip-privileged-{{ ocp_namespace }}"
+      register: crb_check
+
+    - name: Delete SCC ClusterRoleBinding
+      kubernetes.core.k8s:
+        state: absent
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        name: "f5-bigip-privileged-{{ ocp_namespace }}"
+      when: crb_check.resources | length > 0
+
+    - name: Report SCC ClusterRoleBinding status
+      ansible.builtin.debug:
+        msg: "SCC ClusterRoleBinding: {{ 'deleted' if crb_check.resources | length > 0 else 'not found - skipped' }}"
+
+    # ------------------------------------------------------------------
+    # Service account
+    # ------------------------------------------------------------------
+
+    - name: Check if service account exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ServiceAccount
+        name: f5-bigip-sa
+        namespace: "{{ ocp_namespace }}"
+      register: sa_check
+
+    - name: Delete service account
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: ServiceAccount
+        name: f5-bigip-sa
+        namespace: "{{ ocp_namespace }}"
+      when: sa_check.resources | length > 0
+
+    - name: Report service account status
+      ansible.builtin.debug:
+        msg: "Service account: {{ 'deleted' if sa_check.resources | length > 0 else 'not found - skipped' }}"
+
+    # ------------------------------------------------------------------
+    # Namespace
+    # ------------------------------------------------------------------
+
+    - name: Check if namespace exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ ocp_namespace }}"
+      register: ns_check
+      when: delete_namespace | default(false) | bool
+
+    - name: Delete namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ ocp_namespace }}"
+      when:
+        - delete_namespace | default(false) | bool
+        - ns_check.resources | length > 0
+
+    - name: Wait for namespace to be fully removed
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ ocp_namespace }}"
+      register: ns_gone
+      until: ns_gone.resources | length == 0
+      retries: 20
+      delay: 15
+      when:
+        - delete_namespace | default(false) | bool
+        - ns_check.resources | length > 0
+
+    # ------------------------------------------------------------------
+    # Node network — NNCP and OVS bridge
+    # Deletes the NNCP then forces bridge cleanup via a temporary
+    # absent-state NNCP to ensure NMState removes the bridge from all
+    # nodes. Without this, the OVS bridge can persist and cause stale
+    # bridge-mapping conflicts on next deployment.
+    # ------------------------------------------------------------------
+
+    - name: Check if NNCP exists
+      kubernetes.core.k8s_info:
+        api_version: nmstate.io/v1
+        kind: NodeNetworkConfigurationPolicy
+        name: "{{ nmstate_bridge_name }}"
+      register: nncp_check
+      when: delete_node_network | default(false) | bool
+
+    - name: Delete NNCP
+      kubernetes.core.k8s:
+        state: absent
+        api_version: nmstate.io/v1
+        kind: NodeNetworkConfigurationPolicy
+        name: "{{ nmstate_bridge_name }}"
+      when:
+        - delete_node_network | default(false) | bool
+        - nncp_check.resources | length > 0
+
+    - name: Wait for NNCP deletion to propagate
+      kubernetes.core.k8s_info:
+        api_version: nmstate.io/v1
+        kind: NodeNetworkConfigurationPolicy
+        name: "{{ nmstate_bridge_name }}"
+      register: nncp_gone
+      until: nncp_gone.resources | length == 0
+      retries: 20
+      delay: 15
+      when:
+        - delete_node_network | default(false) | bool
+        - nncp_check.resources | length > 0
+
+    - name: Apply bridge cleanup NNCP to force OVS bridge removal
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: nmstate.io/v1
+          kind: NodeNetworkConfigurationPolicy
+          metadata:
+            name: "{{ nmstate_bridge_name }}-cleanup"
+          spec:
+            nodeSelector:
+              node-role.kubernetes.io/worker: ''
+            desiredState:
+              interfaces:
+                - name: "{{ nmstate_bridge_name }}"
+                  type: ovs-bridge
+                  state: absent
+      when: delete_node_network | default(false) | bool
+
+    - name: Wait for bridge cleanup NNCP to complete
+      kubernetes.core.k8s_info:
+        api_version: nmstate.io/v1
+        kind: NodeNetworkConfigurationPolicy
+        name: "{{ nmstate_bridge_name }}-cleanup"
+      register: cleanup_nncp
+      until: >
+        cleanup_nncp.resources | length > 0 and
+        (cleanup_nncp.resources[0].status.conditions | default([]) |
+         selectattr('type', 'equalto', 'Available') |
+         selectattr('status', 'equalto', 'True') |
+         list | length > 0)
+      retries: 20
+      delay: 15
+      when: delete_node_network | default(false) | bool
+
+    - name: Delete bridge cleanup NNCP
+      kubernetes.core.k8s:
+        state: absent
+        api_version: nmstate.io/v1
+        kind: NodeNetworkConfigurationPolicy
+        name: "{{ nmstate_bridge_name }}-cleanup"
+      when: delete_node_network | default(false) | bool
+
+    - name: Report NNCP status
+      ansible.builtin.debug:
+        msg: "NNCP/bridge: {{ 'removed' if (delete_node_network | default(false) | bool) and nncp_check.resources | length > 0 else 'retained (delete_node_network=false)' }}"
+
+    # ------------------------------------------------------------------
+    # NMState operator
+    # ------------------------------------------------------------------
+
+    - name: NMState teardown block
+      when: delete_nmstate | default(false) | bool
+      block:
+
+        - name: Check if NMState instance exists
+          kubernetes.core.k8s_info:
+            api_version: nmstate.io/v1
+            kind: NMState
+            name: nmstate
+          register: nmstate_instance_check
+
+        - name: Delete NMState instance
+          kubernetes.core.k8s:
+            state: absent
+            api_version: nmstate.io/v1
+            kind: NMState
+            name: nmstate
+          when: nmstate_instance_check.resources | length > 0
+
+        - name: Wait for handler pods to terminate
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Pod
+            namespace: openshift-nmstate
+            label_selectors:
+              - component=kubernetes-nmstate-handler
+          register: handler_pods
+          until: handler_pods.resources | length == 0
+          retries: 20
+          delay: 15
+          when: nmstate_instance_check.resources | length > 0
+
+        - name: Delete NMState Subscription
+          kubernetes.core.k8s:
+            state: absent
+            api_version: operators.coreos.com/v1alpha1
+            kind: Subscription
+            name: kubernetes-nmstate-operator
+            namespace: openshift-nmstate
+
+        - name: Get NMState CSV
+          kubernetes.core.k8s_info:
+            api_version: operators.coreos.com/v1alpha1
+            kind: ClusterServiceVersion
+            namespace: openshift-nmstate
+          register: nmstate_csv_check
+
+        - name: Delete NMState CSV
+          kubernetes.core.k8s:
+            state: absent
+            api_version: operators.coreos.com/v1alpha1
+            kind: ClusterServiceVersion
+            name: "{{ item.metadata.name }}"
+            namespace: openshift-nmstate
+          loop: "{{ nmstate_csv_check.resources | selectattr('metadata.name', 'search', 'kubernetes-nmstate') | list }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+
+        - name: Delete NMState namespace
+          kubernetes.core.k8s:
+            state: absent
+            api_version: v1
+            kind: Namespace
+            name: openshift-nmstate
+
+    # ------------------------------------------------------------------
+    # Final summary
+    # ------------------------------------------------------------------
+
+    - name: Teardown summary
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "Licenses revoked:     {{ bigiq_revoke_on_teardown | default(false) | bool }}"
+          - "Teardown complete for namespace: {{ ocp_namespace }}"
+          - "VMs removed:          {{ vm_primary_check.resources | length > 0 or vm_secondary_check.resources | length > 0 }}"
+          - "Secrets removed:      {{ secret_primary_check.resources | length > 0 or secret_secondary_check.resources | length > 0 }}"
+          - "Disk images removed:  {{ delete_disk_images | default(false) | bool }}"
+          - "Namespace removed:    {{ delete_namespace | default(false) | bool }}"
+          - "NNCP/bridges:         {{ 'removed' if (delete_node_network | default(false) | bool) else 'retained' }}"
+          - "NMState operator:     {{ 'removed' if (delete_nmstate | default(false) | bool) else 'retained' }}"
+          - "================================================"

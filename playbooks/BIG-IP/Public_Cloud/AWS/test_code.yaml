@@ -1,0 +1,78 @@
+---
+- name: Deploy F5 BIG-IP HA Pair via CloudFormation (PAYG, us-east-1)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    stack_name: mmabis-bigip-ha-demo
+    region: us-east-1
+    template_file: bigip_ha_3nic.cfn
+    keypair_name: mmabis-bigipKeyPair
+    keypair_file: bigipKeyPair.pem
+    # bigip_ami: ami-xxxxxxxxxxxx  # Replace with PAYG AMI ID from AWS Marketplace
+
+  tasks:
+    - name: Save generated key to local file
+      ansible.builtin.copy:
+        content: "{{ private_key }}"
+        dest: "/tmp/{{ keypair_file }}"
+        mode: '0600'
+
+    - name: Reformat private key
+      ansible.builtin.set_fact:
+        private_key_yaml: "{{ private_key.split('\n') | join('\n') }}"
+        # | regex_replace('\n', '\\\\n') | regex_replace('^\"|\"$', '') }}"
+        # private_key_yaml: "{{ private_key | regex_replace('\n', '\\\\n') }}"
+
+    - name: Debug code
+      ansible.builtin.debug:
+        var: private_key_yaml
+
+    - name: Get public IP
+      ansible.builtin.uri:
+        url: https://api.ipify.org
+        return_content: true
+      register: public_ip
+
+    - name: Show public IP
+      ansible.builtin.debug:
+        msg: "My public IP is {{ public_ip.content }}"
+
+    - name: Gather BIG-IP Management IPs
+      ansible.builtin.set_fact:
+        bigip_mgmt_ips:
+          - 18.232.22.113
+          - 54.157.190.64
+
+    - name: Wait for SSH to be available on BIG-IP instances
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 22
+        delay: 10      # initial wait before first try
+        timeout: 600   # max wait in seconds
+        state: started
+      loop: "{{ bigip_mgmt_ips }}"
+
+    # - name: Run single command - provider-cli
+    #   f5networks.f5_modules.bigip_command:
+    #     commands:
+    #       - "tmsh show sys version"
+    #     provider:
+    #       transport: cli
+    #       server: "{{ item }}"
+    #       user: admin
+    #       ssh_keyfile: "/tmp/{{ keypair_file }}"
+    #       validate_certs: false
+    #       no_f5_teem: true
+    #   loop: "{{ bigip_mgmt_ips }}"
+
+    - name: Reset BIG-IP admin password
+      ansible.builtin.shell: |
+        bash -lc "/usr/bin/tmsh modify auth user admin password {{ bigip_password }}"
+      delegate_to: "{{ item }}"
+      loop: "{{ bigip_mgmt_ips }}"
+      vars:
+        ansible_connection: ssh
+        ansible_ssh_private_key: "{{ lookup('env', 'ANSIBLE_PRIVATE_KEY_FILE') }}"
+        ansible_user: admin

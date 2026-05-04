@@ -1,0 +1,39 @@
+---
+# Role: f5_vm_deploy
+# DVs are pre-uploaded by f5_image_upload role.
+# This role only creates cloud-init secret and deploys the VM CR.
+
+- name: Render cloud-init user-data for this node
+  ansible.builtin.set_fact:
+    cloudinit_userdata: "{{ lookup('template', 'cloudinit_userdata.j2') }}"
+
+- name: Create cloud-init secret for this node
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "cloudinit-{{ node_name }}"
+        namespace: "{{ ocp_namespace }}"
+      type: Opaque
+      stringData:
+        userdata: "{{ cloudinit_userdata }}"
+  no_log: true
+
+- name: Deploy VirtualMachine CR for this node
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', 'vm_manifest.j2') | from_yaml }}"
+
+- name: Wait for VirtualMachineInstance to reach Running phase
+  kubernetes.core.k8s_info:
+    api_version: kubevirt.io/v1
+    kind: VirtualMachineInstance
+    name: "{{ node_name }}"
+    namespace: "{{ ocp_namespace }}"
+  register: vmi_status
+  until: vmi_status.resources[0].status.phase | default('') == 'Running'
+  retries: 40
+  delay: 30
+  failed_when: vmi_status.resources[0].status.phase | default('') == 'Failed'

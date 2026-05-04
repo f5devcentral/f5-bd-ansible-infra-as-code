@@ -1,0 +1,306 @@
+---
+# playbooks/teardown.yml
+# Removes all F5 BIG-IP resources from Nutanix AHV in reverse-order.
+# Safe to run at any stage — resolves resources by name before every delete
+# so it skips gracefully if a resource was never created.
+#
+# MINIMUM COLLECTION VERSION: nutanix.ncp >= 2.5.0
+#
+# Safety flags (all default false — must be explicitly set at runtime):
+#   bigiq_revoke_on_teardown: true  → revokes BIG-IQ licenses before VM deletion
+#   delete_disk_image: true         → removes uploaded image from Image Service
+#   delete_subnets: true            → removes the four VLAN subnets from Prism Central
+#
+# Subnet deletion defaults to false — subnets may be shared with other workloads.
+
+- name: Teardown F5 BIG-IP deployment on Nutanix AHV
+  hosts: localhost
+  gather_facts: false
+  tasks:
+
+    # ------------------------------------------------------------------
+    # Revoke BIG-IQ licenses
+    # Must run before VM deletion — BIG-IP must still be reachable.
+    # ------------------------------------------------------------------
+
+    - name: Revoke license for primary from BIG-IQ
+      ansible.builtin.uri:
+        url: "https://{{ bigiq_host }}/mgmt/cm/device/tasks/licensing/pool/member-management"
+        method: POST
+        body_format: json
+        body:
+          address: "{{ hostvars[f5_primary_node].f5_mgmt_ip }}"
+          assignmentType: "unmanaged"
+          command: "revoke"
+          licensePoolName: "{{ bigiq_pool }}"
+          password: "{{ f5_admin_password }}"
+          user: "admin"
+        return_content: true
+        status_code: [200, 202]
+        force_basic_auth: true
+        user: "{{ bigiq_username }}"
+        password: "{{ bigiq_password }}"
+        validate_certs: false
+      delegate_to: localhost
+      no_log: true
+      when: bigiq_revoke_on_teardown | default(false) | bool
+      failed_when: false
+
+    - name: Revoke license for secondary from BIG-IQ
+      ansible.builtin.uri:
+        url: "https://{{ bigiq_host }}/mgmt/cm/device/tasks/licensing/pool/member-management"
+        method: POST
+        body_format: json
+        body:
+          address: "{{ hostvars[f5_secondary_node].f5_mgmt_ip }}"
+          assignmentType: "unmanaged"
+          command: "revoke"
+          licensePoolName: "{{ bigiq_pool }}"
+          password: "{{ f5_admin_password }}"
+          user: "admin"
+        return_content: true
+        status_code: [200, 202]
+        force_basic_auth: true
+        user: "{{ bigiq_username }}"
+        password: "{{ bigiq_password }}"
+        validate_certs: false
+      delegate_to: localhost
+      no_log: true
+      when: bigiq_revoke_on_teardown | default(false) | bool
+      failed_when: false
+
+    - name: Report license revocation status
+      ansible.builtin.debug:
+        msg: "BIG-IQ license revoked: {{ 'completed' if (bigiq_revoke_on_teardown | default(false) | bool) else 'skipped (bigiq_revoke_on_teardown=false)' }}"
+
+    # ------------------------------------------------------------------
+    # Resolve VM ext_ids by name
+    # ------------------------------------------------------------------
+
+    - name: Look up primary VM ext_id
+      nutanix.ncp.ntnx_vms_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ f5_primary_node }}'"
+      register: _primary_vm_lookup
+      no_log: true
+
+    - name: Look up secondary VM ext_id
+      nutanix.ncp.ntnx_vms_info_v2:
+        filter: "name eq '{{ f5_secondary_node }}'"
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+      register: _secondary_vm_lookup
+      no_log: true
+
+    - name: Set VM ext_id facts
+      ansible.builtin.set_fact:
+        _primary_vm_ext_id: >-
+          {{
+            (_primary_vm_lookup.response |
+             selectattr('name', 'equalto', f5_primary_node) |
+             map(attribute='ext_id') | list | first)
+            if (_primary_vm_lookup.response |
+                selectattr('name', 'equalto', f5_primary_node) |
+                list | length > 0)
+            else ''
+          }}
+        _secondary_vm_ext_id: >-
+          {{
+            (_secondary_vm_lookup.response |
+             selectattr('name', 'equalto', f5_secondary_node) |
+             map(attribute='ext_id') | list | first)
+            if (_secondary_vm_lookup.response |
+                selectattr('name', 'equalto', f5_secondary_node) |
+                list | length > 0)
+            else ''
+          }}
+
+    # ------------------------------------------------------------------
+    # Power off VMs before deletion (ACPI graceful shutdown)
+    # ------------------------------------------------------------------
+
+    - name: Power off primary VM
+      nutanix.ncp.ntnx_vms_power_actions_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        ext_id: "{{ _primary_vm_ext_id }}"
+        action: ACPI_SHUTDOWN
+      when: _primary_vm_ext_id != ''
+      failed_when: false
+      no_log: true
+
+    - name: Power off secondary VM
+      nutanix.ncp.ntnx_vms_power_actions_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        ext_id: "{{ _secondary_vm_ext_id }}"
+        action: ACPI_SHUTDOWN
+      when: _secondary_vm_ext_id != ''
+      failed_when: false
+      no_log: true
+
+    - name: Wait for VMs to power off
+      ansible.builtin.pause:
+        seconds: 30
+      when: _primary_vm_ext_id != '' or _secondary_vm_ext_id != ''
+
+    # ------------------------------------------------------------------
+    # Delete VMs
+    # ------------------------------------------------------------------
+
+    - name: Delete primary VM — {{ f5_primary_node }}
+      nutanix.ncp.ntnx_vms_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        state: absent
+        ext_id: "{{ _primary_vm_ext_id }}"
+      when: _primary_vm_ext_id != ''
+      register: _primary_delete
+
+    - name: Delete secondary VM — {{ f5_secondary_node }}
+      nutanix.ncp.ntnx_vms_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        state: absent
+        ext_id: "{{ _secondary_vm_ext_id }}"
+      when: _secondary_vm_ext_id != ''
+      register: _secondary_delete
+
+    - name: Report VM deletion status
+      ansible.builtin.debug:
+        msg:
+          - "Primary VM ({{ f5_primary_node }}):   {{ 'deleted' if _primary_vm_ext_id != '' else 'not found — skipped' }}"
+          - "Secondary VM ({{ f5_secondary_node }}): {{ 'deleted' if _secondary_vm_ext_id != '' else 'not found — skipped' }}"
+
+    # ------------------------------------------------------------------
+    # Delete image from Nutanix Image Service
+    # Skipped by default — image can be reused for re-deployments.
+    # Set delete_disk_image: true to remove.
+    # ------------------------------------------------------------------
+
+    - name: Look up image ext_id
+      nutanix.ncp.ntnx_images_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ nutanix_image_name }}'"
+      register: _image_lookup
+      when: delete_disk_image | default(false) | bool
+      no_log: true
+
+    - name: Set image ext_id fact for deletion
+      ansible.builtin.set_fact:
+        _teardown_image_ext_id: >-
+          {{
+            (_image_lookup.response |
+             selectattr('name', 'equalto', nutanix_image_name) |
+             map(attribute='ext_id') | list | first)
+            if (_image_lookup.response |
+                selectattr('name', 'equalto', nutanix_image_name) |
+                list | length > 0)
+            else ''
+          }}
+      when: delete_disk_image | default(false) | bool
+
+    - name: Delete image from Nutanix Image Service
+      nutanix.ncp.ntnx_images_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        state: absent
+        ext_id: "{{ _teardown_image_ext_id }}"
+      when:
+        - delete_disk_image | default(false) | bool
+        - _teardown_image_ext_id | default('') != ''
+
+    - name: Report image deletion status
+      ansible.builtin.debug:
+        msg: >-
+          Image '{{ nutanix_image_name }}':
+          {% if not (delete_disk_image | default(false) | bool) %}
+          retained (delete_disk_image=false)
+          {% elif _teardown_image_ext_id | default('') != '' %}
+          deleted
+          {% else %}
+          not found — skipped
+          {% endif %}
+
+    # ------------------------------------------------------------------
+    # Delete VLAN subnets
+    # Skipped by default — subnets may be shared with other workloads.
+    # Set delete_subnets: true to remove.
+    # ------------------------------------------------------------------
+
+    - name: Look up subnet ext_ids for deletion
+      nutanix.ncp.ntnx_subnets_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ item.subnet_name }}'"
+      register: _subnet_teardown_lookups
+      loop: "{{ f5_networks }}"
+      loop_control:
+        label: "{{ item.subnet_name }}"
+      when: delete_subnets | default(false) | bool
+      no_log: true
+
+    - name: Delete VLAN subnets
+      nutanix.ncp.ntnx_subnets_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        state: absent
+        ext_id: "{{ item.response[0].ext_id }}"
+      loop: "{{ _subnet_teardown_lookups.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.subnet_name }}"
+      when:
+        - delete_subnets | default(false) | bool
+        - item.response | default([]) | length > 0
+
+    - name: Report subnet deletion status
+      ansible.builtin.debug:
+        msg: "Subnets: {{ 'deleted' if (delete_subnets | default(false) | bool) else 'retained (delete_subnets=false)' }}"
+
+    # ------------------------------------------------------------------
+    # Final summary
+    # ------------------------------------------------------------------
+
+    - name: Teardown summary
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "Teardown complete — Nutanix AHV"
+          - "Licenses revoked:  {{ bigiq_revoke_on_teardown | default(false) | bool }}"
+          - "Primary VM:        {{ 'deleted' if _primary_vm_ext_id != '' else 'not found — skipped' }}"
+          - "Secondary VM:      {{ 'deleted' if _secondary_vm_ext_id != '' else 'not found — skipped' }}"
+          - "Image deleted:     {{ delete_disk_image | default(false) | bool }}"
+          - "Subnets deleted:   {{ delete_subnets | default(false) | bool }}"
+          - "================================================"

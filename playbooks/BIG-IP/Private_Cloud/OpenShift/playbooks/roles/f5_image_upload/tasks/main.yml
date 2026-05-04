@@ -1,0 +1,588 @@
+---
+# Role: f5_image_upload
+# Auth for k8s tasks: K8S_AUTH_* env vars from AAP credential (no kubeconfig).
+# Auth for virtctl on bastion: temp kubeconfig written at runtime from the
+# same K8S_AUTH_* env vars, used once, then deleted.
+# Idempotent: skips upload for any DataVolume that already exists and is Succeeded.
+# Uploads directly to per-node DataVolumes in parallel — no source DV or clone needed.
+
+# ------------------------------------------------------------------
+# Bastion prerequisites — virtctl
+# ------------------------------------------------------------------
+
+- name: Get virtctl download URL from OCP cluster
+  kubernetes.core.k8s_info:
+    api_version: console.openshift.io/v1
+    kind: ConsoleCLIDownload
+    name: virtctl-clidownloads-kubevirt-hyperconverged
+  register: virtctl_cli_download
+  delegate_to: localhost
+
+- name: Set virtctl download URL fact
+  ansible.builtin.set_fact:
+    virtctl_download_url: >-
+      {{
+        virtctl_cli_download.resources[0].spec.links |
+        selectattr('text', 'search', 'Linux.*' + virtctl_arch) |
+        map(attribute='href') |
+        first
+      }}
+
+- name: Debug virtctl download URL
+  ansible.builtin.debug:
+    msg: "virtctl download URL: {{ virtctl_download_url }}"
+
+- name: Check virtctl is installed on bastion
+  ansible.builtin.stat:
+    path: /usr/local/bin/virtctl
+  register: virtctl_stat
+  delegate_to: bastion01
+
+- name: Download and install virtctl on bastion
+  when: not virtctl_stat.stat.exists
+  block:
+    - name: Download virtctl tarball
+      ansible.builtin.get_url:
+        url: "{{ virtctl_download_url }}"
+        dest: /tmp/virtctl.tar.gz
+        mode: '0644'
+        validate_certs: false
+      become: true
+      delegate_to: bastion01
+
+    - name: Extract virtctl binary
+      ansible.builtin.unarchive:
+        src: /tmp/virtctl.tar.gz
+        dest: /usr/local/bin/
+        remote_src: true
+        mode: '0755'
+      become: true
+      delegate_to: bastion01
+
+    - name: Clean up tarball
+      ansible.builtin.file:
+        path: /tmp/virtctl.tar.gz
+        state: absent
+      become: true
+      delegate_to: bastion01
+
+
+- name: Verify virtctl works
+  ansible.builtin.command: /usr/local/bin/virtctl version --client
+  delegate_to: bastion01
+  register: virtctl_ver_check
+  changed_when: false
+
+- name: Display virtctl version
+  ansible.builtin.debug:
+    msg: "{{ virtctl_ver_check.stdout }}"
+
+# ------------------------------------------------------------------
+# Check which node DVs need uploading
+# ------------------------------------------------------------------
+
+- name: Check if node DataVolumes already exist and succeeded
+  kubernetes.core.k8s_info:
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: DataVolume
+    name: "{{ f5_datavolume_name }}-{{ item }}"
+    namespace: "{{ ocp_namespace }}"
+  register: dv_check
+  loop:
+    - "{{ f5_primary_node }}"
+    - "{{ f5_secondary_node }}"
+
+- name: Set upload needed facts per node
+  ansible.builtin.set_fact:
+    upload_needed_primary: >-
+      {{
+        dv_check.results[0].resources | length == 0 or
+        (dv_check.results[0].resources[0].status.phase | default('')) != 'Succeeded'
+      }}
+    upload_needed_secondary: >-
+      {{
+        dv_check.results[1].resources | length == 0 or
+        (dv_check.results[1].resources[0].status.phase | default('')) != 'Succeeded'
+      }}
+    upload_needed: >-
+      {{
+        dv_check.results[0].resources | length == 0 or
+        (dv_check.results[0].resources[0].status.phase | default('')) != 'Succeeded' or
+        dv_check.results[1].resources | length == 0 or
+        (dv_check.results[1].resources[0].status.phase | default('')) != 'Succeeded'
+      }}
+
+- name: Image upload block
+  when: upload_needed
+  block:
+
+    # ------------------------------------------------------------------
+    # Bastion prerequisites
+    # ------------------------------------------------------------------
+
+    - name: Ensure cifs-utils is installed on bastion
+      ansible.builtin.package:
+        name: cifs-utils
+        state: present
+      become: true
+      delegate_to: bastion01
+
+    - name: Check virtctl is installed on bastion
+      ansible.builtin.stat:
+        path: /usr/local/bin/virtctl
+      register: virtctl_stat
+      delegate_to: bastion01
+
+    - name: Fail with install instructions if virtctl missing
+      ansible.builtin.fail:
+        msg: >
+          virtctl not found at /usr/local/bin/virtctl on bastion01.
+          Install matching your OCP KubeVirt version:
+            VERSION=$(oc get kubevirt kubevirt -n openshift-cnv
+              -o jsonpath='{.status.observedKubeVirtVersion}')
+            curl -Lo /usr/local/bin/virtctl
+              https://github.com/kubevirt/kubevirt/releases/download/${VERSION}/virtctl-${VERSION}-linux-amd64
+            chmod +x /usr/local/bin/virtctl
+      when: not virtctl_stat.stat.exists
+
+    # ------------------------------------------------------------------
+    # CIFS mount on bastion
+    # ------------------------------------------------------------------
+
+    - name: Create CIFS mount point on bastion
+      ansible.builtin.file:
+        path: "{{ cifs_mountpoint }}"
+        state: directory
+        mode: '0755'
+      become: true
+      delegate_to: bastion01
+
+    - name: Mount CIFS share on bastion
+      ansible.posix.mount:
+        src: "{{ cifs_share }}"
+        path: "{{ cifs_mountpoint }}"
+        fstype: cifs
+        opts: "username={{ cifs_username }},password={{ cifs_password }},domain={{ cifs_domain }},uid=0,gid=0,file_mode=0644,dir_mode=0755"
+        state: mounted
+      become: true
+      delegate_to: bastion01
+
+    - name: Verify QCOW2 exists on share
+      ansible.builtin.stat:
+        path: "{{ cifs_mountpoint }}/{{ qcow2_filename }}"
+      register: qcow2_stat
+      delegate_to: bastion01
+      failed_when: not qcow2_stat.stat.exists
+
+    - name: Verify DO RPM exists on share
+      ansible.builtin.stat:
+        path: "{{ cifs_mountpoint }}/{{ do_rpm_filename }}"
+      register: do_rpm_stat
+      delegate_to: bastion01
+      failed_when:
+        - do_rpm_install_from_cifs | default(false) | bool
+        - not do_rpm_stat.stat.exists
+      when: do_rpm_install_from_cifs | default(false) | bool
+
+    # ------------------------------------------------------------------
+    # Store Declarative Onboarding (DO) into bastion Box in cached area
+    # ------------------------------------------------------------------
+
+    - name: Create F5 cache directory on bastion
+      ansible.builtin.file:
+        path: "{{ bastion_f5_cache }}"
+        state: directory
+        mode: '0755'
+      become: true
+      delegate_to: bastion01
+      when: do_rpm_install_from_cifs | default(false) | bool
+
+    - name: Cache DO RPM on bastion from CIFS
+      ansible.builtin.copy:
+        src: "{{ cifs_mountpoint }}/{{ do_rpm_filename }}"
+        dest: "{{ bastion_f5_cache }}/{{ do_rpm_filename }}"
+        remote_src: true
+        mode: '0644'
+      delegate_to: bastion01
+      when: do_rpm_install_from_cifs | default(false) | bool
+
+    # ------------------------------------------------------------------
+    # Get CDI upload proxy URL
+    # ------------------------------------------------------------------
+
+    - name: Get CDI upload proxy URL
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: CDIConfig
+        name: config
+      register: cdi_config
+
+    - name: Set CDI upload proxy fact
+      ansible.builtin.set_fact:
+        cdi_upload_proxy: "{{ cdi_config.resources[0].status.uploadProxyURL }}"
+
+    # ------------------------------------------------------------------
+    # Create DataVolume upload targets for each node
+    # ------------------------------------------------------------------
+
+    - name: Create DataVolume upload target for primary
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cdi.kubevirt.io/v1beta1
+          kind: DataVolume
+          metadata:
+            name: "{{ f5_datavolume_name }}-{{ f5_primary_node }}"
+            namespace: "{{ ocp_namespace }}"
+            annotations:
+              cdi.kubevirt.io/storage.upload.target: ""
+          spec:
+            source:
+              upload: {}
+            storage:
+              accessModes:
+                - "{{ f5_storage_access_mode | default('ReadWriteOnce') }}"
+              resources:
+                requests:
+                  storage: "{{ f5_disk_size }}"
+              storageClassName: "{{ f5_storage_class }}"
+      when: upload_needed_primary
+
+    - name: Create DataVolume upload target for secondary
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: cdi.kubevirt.io/v1beta1
+          kind: DataVolume
+          metadata:
+            name: "{{ f5_datavolume_name }}-{{ f5_secondary_node }}"
+            namespace: "{{ ocp_namespace }}"
+            annotations:
+              cdi.kubevirt.io/storage.upload.target: ""
+          spec:
+            source:
+              upload: {}
+            storage:
+              accessModes:
+                - "{{ f5_storage_access_mode | default('ReadWriteOnce') }}"
+              resources:
+                requests:
+                  storage: "{{ f5_disk_size }}"
+              storageClassName: "{{ f5_storage_class }}"
+      when: upload_needed_secondary
+
+    # ------------------------------------------------------------------
+    # WaitForFirstConsumer workaround
+    # Some storage classes (e.g. LVMS) use WaitForFirstConsumer binding
+    # mode which requires a consumer pod to be scheduled before the PVC
+    # will bind. CDI upload needs the PVC bound first — deadlock.
+    # Fix: annotate the PVC with a selected node to force binding.
+    # Skipped automatically for Immediate binding storage classes (NFS etc).
+    # ------------------------------------------------------------------
+
+    - name: Check if storage class uses WaitForFirstConsumer binding
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+        name: "{{ f5_storage_class }}"
+      register: sc_info
+
+    - name: Set binding mode fact
+      ansible.builtin.set_fact:
+        sc_wait_for_consumer: >-
+          {{ sc_info.resources[0].volumeBindingMode == 'WaitForFirstConsumer' }}
+
+    - name: Get dedicated worker nodes for WaitForFirstConsumer binding workaround
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        label_selectors:
+          - node-role.kubernetes.io/worker=
+      register: worker_nodes_dedicated
+      when: sc_wait_for_consumer | bool
+
+    - name: Get all nodes as fallback for SNO
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+      register: worker_nodes_all
+      when:
+        - sc_wait_for_consumer | bool
+        - worker_nodes_dedicated.resources | length == 0
+
+    - name: Set worker nodes fact
+      ansible.builtin.set_fact:
+        worker_nodes: >-
+          {{
+            worker_nodes_dedicated
+            if worker_nodes_dedicated.resources | length > 0
+            else worker_nodes_all
+          }}
+      when: sc_wait_for_consumer | bool
+
+    - name: Report WaitForFirstConsumer workaround required
+      ansible.builtin.debug:
+        msg: >
+          Storage class '{{ f5_storage_class }}' uses WaitForFirstConsumer binding mode.
+          Annotating PVCs with selected nodes to force PVC binding for CDI upload.
+          Available nodes: {{ worker_nodes.resources | map(attribute='metadata.name') | list }}
+      when: sc_wait_for_consumer | bool
+
+    - name: Wait for primary PVC to be created by CDI
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ f5_datavolume_name }}-{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: pvc_primary_wait
+      until: pvc_primary_wait.resources | length > 0
+      retries: 20
+      delay: 5
+      when:
+        - sc_wait_for_consumer | bool
+        - upload_needed_primary
+
+    - name: Wait for secondary PVC to be created by CDI
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ f5_datavolume_name }}-{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: pvc_secondary_wait
+      until: pvc_secondary_wait.resources | length > 0
+      retries: 20
+      delay: 5
+      when:
+        - sc_wait_for_consumer | bool
+        - upload_needed_secondary
+
+    - name: Force PVC binding for primary by annotating selected node
+      kubernetes.core.k8s:
+        state: patched
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ f5_datavolume_name }}-{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+        definition:
+          metadata:
+            annotations:
+              volume.kubernetes.io/selected-node: "{{ worker_nodes.resources[0].metadata.name }}"
+      when:
+        - sc_wait_for_consumer | bool
+        - upload_needed_primary
+      retries: 10
+      delay: 5
+      register: pvc_primary_patch
+      until: pvc_primary_patch is not failed
+
+    - name: Force PVC binding for secondary by annotating selected node
+      kubernetes.core.k8s:
+        state: patched
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ f5_datavolume_name }}-{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+        definition:
+          metadata:
+            annotations:
+              volume.kubernetes.io/selected-node: >-
+                {{
+                  worker_nodes.resources[1].metadata.name
+                  if worker_nodes.resources | length > 1
+                  else worker_nodes.resources[0].metadata.name
+                }}
+      when:
+        - sc_wait_for_consumer | bool
+        - upload_needed_secondary
+      retries: 10
+      delay: 5
+      register: pvc_secondary_patch
+      until: pvc_secondary_patch is not failed
+
+    - name: Report WaitForFirstConsumer workaround applied
+      ansible.builtin.debug:
+        msg:
+          - "WaitForFirstConsumer workaround applied:"
+          - "primary PVC → node: {{ worker_nodes.resources[0].metadata.name }}"
+          - "secondary PVC → node: {{ worker_nodes.resources[1].metadata.name if worker_nodes.resources | length > 1 else worker_nodes.resources[0].metadata.name }}"
+      when: sc_wait_for_consumer | bool
+
+    # ------------------------------------------------------------------
+    # Wait for DVs to be ready for upload
+    # ------------------------------------------------------------------
+
+    - name: Wait for primary DataVolume to be ready for upload
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        name: "{{ f5_datavolume_name }}-{{ f5_primary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: dv_primary_ready
+      until: >
+        dv_primary_ready.resources[0].status.phase | default('') in ['UploadReady', 'WaitForFirstConsumer']
+      retries: 20
+      delay: 10
+      when: upload_needed_primary
+
+    - name: Wait for secondary DataVolume to be ready for upload
+      kubernetes.core.k8s_info:
+        api_version: cdi.kubevirt.io/v1beta1
+        kind: DataVolume
+        name: "{{ f5_datavolume_name }}-{{ f5_secondary_node }}"
+        namespace: "{{ ocp_namespace }}"
+      register: dv_secondary_ready
+      until: >
+        dv_secondary_ready.resources[0].status.phase | default('') in ['UploadReady', 'WaitForFirstConsumer']
+      retries: 20
+      delay: 10
+      when: upload_needed_secondary
+
+    # ------------------------------------------------------------------
+    # Build temp kubeconfig on bastion from AAP-injected env vars.
+    # K8S_AUTH_HOST and K8S_AUTH_API_KEY are set in the EE at runtime
+    # by the AAP "OpenShift or Kubernetes API" credential type.
+    # We look them up here (in the EE) and write to the bastion as a
+    # temp file so virtctl can authenticate. Deleted immediately after.
+    # ------------------------------------------------------------------
+
+    - name: Get current timestamp for temp file naming
+      ansible.builtin.setup:
+        gather_subset:
+          - date_time
+      delegate_to: localhost
+
+    - name: Set temp kubeconfig path
+      ansible.builtin.set_fact:
+        tmp_kubeconfig: "/tmp/.virtctl-kubeconfig-{{ ansible_date_time.epoch }}"
+
+    - name: Write temp kubeconfig on bastion from AAP-injected token
+      ansible.builtin.copy:
+        content: |
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              server: "{{ lookup('env', 'K8S_AUTH_HOST') }}"
+              insecure-skip-tls-verify: true
+            name: ocp-cluster
+          contexts:
+          - context:
+              cluster: ocp-cluster
+              user: aap-sa
+            name: ocp-context
+          current-context: ocp-context
+          users:
+          - name: aap-sa
+            user:
+              token: "{{ lookup('env', 'K8S_AUTH_API_KEY') }}"
+        dest: "{{ tmp_kubeconfig }}"
+        mode: '0600'
+      delegate_to: bastion01
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # Parallel uploads via async
+    # ------------------------------------------------------------------
+
+    - name: Upload QCOW2 to primary DV async
+      ansible.builtin.shell: >
+        /usr/local/bin/virtctl image-upload dv {{ f5_datavolume_name }}-{{ f5_primary_node }}
+        --namespace {{ ocp_namespace }}
+        --image-path {{ cifs_mountpoint }}/{{ qcow2_filename }}
+        --uploadproxy-url {{ cdi_upload_proxy }}
+        --kubeconfig {{ tmp_kubeconfig }}
+        --insecure
+        --wait-secs=600
+      delegate_to: bastion01
+      async: 3600
+      poll: 0
+      register: upload_primary_job
+      when: upload_needed_primary
+
+    - name: Upload QCOW2 to secondary DV async
+      ansible.builtin.shell: >
+        /usr/local/bin/virtctl image-upload dv {{ f5_datavolume_name }}-{{ f5_secondary_node }}
+        --namespace {{ ocp_namespace }}
+        --image-path {{ cifs_mountpoint }}/{{ qcow2_filename }}
+        --uploadproxy-url {{ cdi_upload_proxy }}
+        --kubeconfig {{ tmp_kubeconfig }}
+        --insecure
+        --wait-secs=600
+      delegate_to: bastion01
+      async: 3600
+      poll: 0
+      register: upload_secondary_job
+      when: upload_needed_secondary
+
+    - name: Wait for primary upload to complete
+      ansible.builtin.async_status:
+        jid: "{{ upload_primary_job.ansible_job_id }}"
+      register: upload_primary_result
+      until: upload_primary_result.finished
+      retries: 120
+      delay: 30
+      delegate_to: bastion01
+      when: upload_needed_primary
+
+    - name: Wait for secondary upload to complete
+      ansible.builtin.async_status:
+        jid: "{{ upload_secondary_job.ansible_job_id }}"
+      register: upload_secondary_result
+      until: upload_secondary_result.finished
+      retries: 120
+      delay: 30
+      delegate_to: bastion01
+      when: upload_needed_secondary
+
+  always:
+    # ------------------------------------------------------------------
+    # Cleanup — runs whether upload succeeded or failed
+    # ------------------------------------------------------------------
+
+    - name: Remove temp kubeconfig from bastion
+      ansible.builtin.file:
+        path: "{{ tmp_kubeconfig }}"
+        state: absent
+      delegate_to: bastion01
+      when: tmp_kubeconfig is defined
+
+    - name: Unmount CIFS share on bastion
+      ansible.posix.mount:
+        path: "{{ cifs_mountpoint }}"
+        state: unmounted
+      become: true
+      delegate_to: bastion01
+
+# ------------------------------------------------------------------
+# Wait for both DVs to reach Succeeded
+# ------------------------------------------------------------------
+
+- name: Wait for primary DataVolume to reach Succeeded
+  kubernetes.core.k8s_info:
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: DataVolume
+    name: "{{ f5_datavolume_name }}-{{ f5_primary_node }}"
+    namespace: "{{ ocp_namespace }}"
+  register: dv_primary_status
+  until: dv_primary_status.resources[0].status.phase | default('') == 'Succeeded'
+  retries: 60
+  delay: 30
+  failed_when: dv_primary_status.resources[0].status.phase | default('') == 'Failed'
+
+- name: Wait for secondary DataVolume to reach Succeeded
+  kubernetes.core.k8s_info:
+    api_version: cdi.kubevirt.io/v1beta1
+    kind: DataVolume
+    name: "{{ f5_datavolume_name }}-{{ f5_secondary_node }}"
+    namespace: "{{ ocp_namespace }}"
+  register: dv_secondary_status
+  until: dv_secondary_status.resources[0].status.phase | default('') == 'Succeeded'
+  retries: 60
+  delay: 30
+  failed_when: dv_secondary_status.resources[0].status.phase | default('') == 'Failed'
+
+- name: Report upload status
+  ansible.builtin.debug:
+    msg:
+      - "{{ f5_datavolume_name }}-{{ f5_primary_node }}: {{ dv_primary_status.resources[0].status.phase }}"
+      - "{{ f5_datavolume_name }}-{{ f5_secondary_node }}: {{ dv_secondary_status.resources[0].status.phase }}"

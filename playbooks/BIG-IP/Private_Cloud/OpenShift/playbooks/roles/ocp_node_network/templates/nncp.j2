@@ -1,0 +1,25 @@
+apiVersion: nmstate.io/v1
+kind: NodeNetworkConfigurationPolicy
+metadata:
+  name: "{{ nmstate_bridge_name }}"
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/worker: ''
+  desiredState:
+    ovn:
+      bridge-mappings:
+{% for vlan in f5_networks %}
+      - localnet: "{{ vlan.nad_name }}"
+        bridge: "{{ nmstate_bridge_name }}"
+        state: present
+{% endfor %}
+    interfaces:
+    - name: "{{ nmstate_bridge_name }}"
+      type: ovs-bridge
+      state: up
+      bridge:
+        allow-extra-patch-ports: true
+        options:
+          stp: false
+        port:
+          - name: "{{ nmstate_nic }}"

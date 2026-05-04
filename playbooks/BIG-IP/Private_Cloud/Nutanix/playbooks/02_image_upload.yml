@@ -1,0 +1,12 @@
+---
+# playbooks/02_image_upload.yml
+# Mounts CIFS share on bastion, streams the QCOW2 to the Nutanix Image
+# Service via Prism Central REST API (curl from bastion).
+# Idempotent — skips if image already exists and is COMPLETE.
+# One upload serves both nodes — Nutanix clones at VM creation time.
+
+- name: Phase 2 — Upload F5 QCOW2 image to Nutanix Image Service
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: nutanix_image_upload

@@ -1,0 +1,39 @@
+---
+- name: Deploy F5 BIG-IP HA Pair via CloudFormation (PAYG, us-east-1)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    stack_name: mmabis-bigip-ha-demo
+    region: us-east-1
+    template_file: bigip_ha_3nic.cfn
+    keypair_name: mmabis-bigipKeyPair
+    keypair_file: ./bigipKeyPair.pem
+    # bigip_ami: ami-xxxxxxxxxxxx  # Replace with PAYG AMI ID from AWS Marketplace
+
+  tasks:
+
+    - name: Delete CloudFormation stack after successful deployment
+      amazon.aws.cloudformation:
+        stack_name: "{{ stack_name }}"
+        region: "{{ region }}"
+        state: absent
+      register: stack_delete
+
+    - name: Confirm stack deletion
+      amazon.aws.cloudformation_info:
+        stack_name: "{{ stack_name }}"
+        region: "{{ region }}"
+      register: check_delete
+      failed_when: check_delete.stacks is defined and check_delete.stacks | length > 0
+      retries: 10
+      delay: 30
+      ignore_errors: true
+
+    - name: Delete SSH keypair for BIG-IP
+      # use no_log to avoid private key being displayed into output
+      amazon.aws.ec2_key:
+        name: "{{ keypair_name }}"
+        region: "{{ region }}"
+        state: absent

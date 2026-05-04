@@ -1,0 +1,178 @@
+---
+# Role: nutanix_network
+#
+# MINIMUM COLLECTION VERSION: nutanix.ncp >= 2.5.0
+# (ntnx_virtual_switches_info_v2 and ntnx_subnets_v2 require v2.5.0)
+# Install: ansible-galaxy collection install nutanix.ncp
+#
+# Creates VLAN-backed subnets in Prism Central for each entry in f5_networks.
+# Equivalent to OCP's ocp_nmstate_operator + ocp_node_network roles — this is
+# the "plug in the cables" phase that must complete before VMs can be placed.
+#
+# Uses ntnx_subnets_v2 (v4 API). Subnets are unmanaged (no IPAM/DHCP) —
+# F5 BIG-IP manages its own addressing via cloud-init and DO.
+#
+# Idempotent — ntnx_subnets_v2 with state: present skips existing subnets.
+# Requires nutanix_cluster_ext_id set by nutanix_prereqs role.
+
+# ------------------------------------------------------------------
+# Resolve cluster ext_id if not already cached from nutanix_prereqs
+# ------------------------------------------------------------------
+
+- name: Resolve cluster ext_id (fresh lookup if not cached)
+  when: nutanix_cluster_ext_id is not defined
+  block:
+    - name: Look up cluster by name
+      nutanix.ncp.ntnx_clusters_info_v2:
+        filter: "name eq '{{ nutanix_cluster_name }}'"
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+      register: _cluster_lookup
+      no_log: true
+
+    - name: Cache cluster ext_id
+      ansible.builtin.set_fact:
+        nutanix_cluster_ext_id: "{{ _cluster_lookup.response[0].ext_id }}"
+
+# ------------------------------------------------------------------
+# Resolve virtual switch ext_id
+# ntnx_virtual_switches_info_v2 requires nutanix.ncp >= 2.5.0.
+# The virtual switch (vs0 by default) anchors VLAN subnets to the
+# physical uplink on AHV hosts. All four F5 networks use the same
+# virtual_switch value — we resolve it once from the first network.
+# ------------------------------------------------------------------
+
+- name: Resolve virtual switch ext_id
+  block:
+
+    - name: List virtual switches scoped to target cluster
+      nutanix.ncp.ntnx_virtual_switches_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "clusterExtIds eq '{{ nutanix_cluster_ext_id }}'"
+      register: _vswitches_info
+      no_log: true
+
+    - name: Fail if no virtual switches found on cluster
+      ansible.builtin.fail:
+        msg: |
+          No virtual switches found on cluster '{{ nutanix_cluster_name }}'.
+          Verify the cluster ext_id and Prism Central connectivity.
+      when: _vswitches_info.response | length == 0
+
+    - name: Locate virtual switch by name
+      ansible.builtin.set_fact:
+        _vs_name: "{{ f5_networks[0].virtual_switch }}"
+        _matched_vs: >-
+          {{
+            _vswitches_info.response |
+            selectattr('name', 'equalto', f5_networks[0].virtual_switch) |
+            list
+          }}
+
+    - name: Fail if named virtual switch not found
+      ansible.builtin.fail:
+        msg: |
+          Virtual switch '{{ _vs_name }}' not found on cluster '{{ nutanix_cluster_name }}'.
+          Update virtual_switch in f5_networks extra_vars to match one of:
+          {{ _vswitches_info.response | map(attribute='name') | list }}
+      when: _matched_vs | length == 0
+
+    - name: Cache virtual switch ext_id
+      ansible.builtin.set_fact:
+        nutanix_vs_ext_id: "{{ _matched_vs[0].ext_id }}"
+
+    - name: Display resolved virtual switch
+      ansible.builtin.debug:
+        msg: "Virtual switch '{{ _vs_name }}' — ext_id: {{ nutanix_vs_ext_id }} ✓"
+
+# ------------------------------------------------------------------
+# Create VLAN-backed subnets for each F5 network.
+# ntnx_subnets_v2 with state: present is idempotent — skips if exists.
+# No IPAM block — F5 owns all IP assignment on these VLANs.
+# ------------------------------------------------------------------
+
+- name: Create VLAN-backed subnets for F5 networks
+  block:
+
+    - name: "Create subnets and VLANs"
+      nutanix.ncp.ntnx_subnets_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        state: present
+        name: "{{ item.subnet_name }}"
+        subnet_type: VLAN
+        vlan_id: "{{ item.vlan_id }}"
+        cluster_reference: "{{ nutanix_cluster_ext_id }}"
+        virtual_switch_ext_id: "{{ nutanix_vs_ext_id }}"
+      register: _subnet_results
+      loop: "{{ f5_networks }}"
+      loop_control:
+        label: "{{ item.name }} → {{ item.subnet_name }} (VLAN {{ item.vlan_id }})"
+
+    - name: Report subnet results
+      ansible.builtin.debug:
+        msg: >-
+          Subnet '{{ item.item.subnet_name }}' (VLAN {{ item.item.vlan_id }}):
+          {{ 'created' if item.changed else 'already exists — skipped' }}
+      loop: "{{ _subnet_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+# ------------------------------------------------------------------
+# Resolve and cache subnet ext_ids for downstream roles.
+# Stored as nutanix_subnet_ext_ids dict: { subnet_name: ext_id, ... }
+# ------------------------------------------------------------------
+
+- name: Resolve and cache subnet ext_ids
+  block:
+
+    - name: Look up subnet ext_id — {{ item.subnet_name }}
+      nutanix.ncp.ntnx_subnets_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+        filter: "name eq '{{ item.subnet_name }}'"
+      register: _subnet_lookup
+      loop: "{{ f5_networks }}"
+      loop_control:
+        label: "{{ item.subnet_name }}"
+      no_log: true
+
+    - name: Build subnet name to ext_id map
+      ansible.builtin.set_fact:
+        nutanix_subnet_ext_ids: >-
+          {{
+            nutanix_subnet_ext_ids | default({}) |
+            combine({ item.item.subnet_name: item.response[0].ext_id })
+          }}
+      loop: "{{ _subnet_lookup.results }}"
+      loop_control:
+        label: "{{ item.item.subnet_name }}"
+
+    - name: Confirm subnet ext_ids resolved
+      ansible.builtin.debug:
+        msg: "{{ item.subnet_name }} → {{ nutanix_subnet_ext_ids[item.subnet_name] }} ✓"
+      loop: "{{ f5_networks }}"
+      loop_control:
+        label: "{{ item.subnet_name }}"
+
+    - name: Network phase summary
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "Nutanix network phase complete"
+          - "VLANs configured: {{ f5_networks | map(attribute='vlan_id') | list }}"
+          - "Subnets ready:    {{ f5_networks | map(attribute='subnet_name') | list }}"
+          - "================================================"

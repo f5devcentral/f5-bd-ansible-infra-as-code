@@ -1,0 +1,90 @@
+F5 BIG-IP HA Pair Deployment — Nutanix AHV
+==========================================
+
+Deploys an active/standby F5 BIG-IP HA pair on Nutanix AHV using
+Ansible Automation Platform (AAP) and the official nutanix.ncp collection.
+
+MINIMUM COLLECTION VERSION
+---------------------------
+  nutanix.ncp >= 2.5.0   <-- REQUIRED, do not use earlier versions
+  f5networks.f5_modules >= 1.28.0
+  ansible.utils >= 3.0.0
+  ansible.posix >= 1.5.0
+
+Install:
+  ansible-galaxy collection install -r collections/requirements.yml
+
+WHY >= 2.5.0
+-------------
+  ntnx_virtual_switches_info_v2  — added in v2.5.0 (needed by nutanix_network role)
+  ntnx_subnets_v2                — stable VLAN subnet CRUD (v2.5.0)
+  ntnx_vms_v2                    — VM lifecycle on v4 API (v2.0.0+, improved in v2.5.0)
+  ntnx_vms_power_actions_v2      — graceful shutdown in teardown (v2.5.0)
+
+All v1 modules (ntnx_vms, ntnx_subnets, ntnx_images without _v2 suffix) are
+deprecated and will be removed in Q4-CY2026. This codebase uses v2 only.
+
+STRUCTURE
+----------
+  ansible.cfg                      Ansible configuration
+  collections/requirements.yml     Collection dependencies
+  extra_vars_aap/extra_vars.yml    All user-configurable variables
+  inventory/hosts.yml              Bastion + F5 node inventory
+  playbooks/
+    site.yml                       Master playbook (runs all phases)
+    00_nutanix_prereqs.yml         Phase 0 — PC connectivity + cluster lookup
+    01_nutanix_network.yml         Phase 1 — Create VLAN subnets in Prism Central
+    02_image_upload.yml            Phase 2 — Upload QCOW2 to Image Service
+    03_deploy_vm.yml               Phase 3 — Deploy BIG-IP VMs on AHV
+    04_onboard.yml                 Phase 4 — Install DO + Declarative Onboarding
+    teardown.yml                   Reverse-order cleanup
+    roles/
+      nutanix_prereqs/             PC connectivity check, cluster ext_id resolution
+      nutanix_network/             VLAN subnet creation via ntnx_subnets_v2
+      nutanix_image_upload/        QCOW2 upload via Prism Central REST API
+      f5_vm_deploy/                VM creation via ntnx_vms_v2
+      f5_wait_mgmt/                Wait for BIG-IP management (platform-agnostic)
+      f5_install_do/               Install DO RPM (platform-agnostic)
+      f5_declarative_onboarding/   POST DO declaration (platform-agnostic)
+
+PHASES vs OPENSHIFT EQUIVALENT
+--------------------------------
+  Phase 0  nutanix_prereqs      ≈  ocp_nmstate_operator (preflight)
+  Phase 1  nutanix_network      ≈  ocp_node_network + ocp_prereqs (network + NADs)
+  Phase 2  image_upload         ≈  f5_image_upload (CDI → Image Service)
+  Phase 3  deploy_vm            ≈  f5_vm_deploy (KubeVirt VM → AHV VM)
+  Phase 4  onboard              =  identical (DO is platform-agnostic)
+
+NETWORKING
+-----------
+  Unlike OpenShift (which needs NMState + OVS bridges + Multus NADs),
+  Nutanix manages VLAN switching natively in AHV. Phase 1 creates four
+  unmanaged VLAN-backed subnets in Prism Central (no IPAM — F5 owns IPs).
+  VMs attach NICs to these subnets by ext_id at creation time.
+
+  Virtual switch (vs0 by default) is the AHV bridge anchoring subnets
+  to physical uplinks. Configure via virtual_switch in f5_networks extra_vars.
+
+REQUIRED VARIABLES (update in extra_vars_aap/extra_vars.yml)
+--------------------------------------------------------------
+  nutanix_host            Prism Central FQDN or IP
+  nutanix_cluster_name    AHV cluster name as shown in Prism Central
+  nutanix_image_name      Name for the uploaded BIG-IP image
+  qcow2_filename          Filename of the QCOW2 on the CIFS share
+  f5_networks             VLAN IDs, subnet names, virtual switch
+  f5_license_type         regkey or bigiq
+  f5_primary_node         Must match a host in inventory/hosts.yml
+  f5_secondary_node       Must match a host in inventory/hosts.yml
+
+AAP CREDENTIAL TYPES NEEDED
+-----------------------------
+  - Nutanix Prism Central  (custom type mapping nutanix_username/password)
+  - Vault                  (cifs_username, cifs_password, f5 credentials)
+  - Machine                (SSH key for bastion01)
+
+TEARDOWN FLAGS
+---------------
+  bigiq_revoke_on_teardown: true   Revoke BIG-IQ licenses first
+  delete_disk_image: true          Remove image from Nutanix Image Service
+  delete_subnets: true             Remove VLAN subnets from Prism Central
+                                   (default false — subnets may be shared)

@@ -1,0 +1,31 @@
+---
+# Ansible Galaxy / AAP collection requirements
+#
+# IMPORTANT: nutanix.ncp >= 2.5.0 is the MINIMUM supported version for this
+# playbook. Earlier versions lack ntnx_virtual_switches_info_v2 (needed by
+# the nutanix_network role) and ntnx_subnets_v2 / ntnx_vms_v2 improvements.
+#
+# Install on your Execution Environment or control node:
+#   ansible-galaxy collection install -r collections/requirements.yml
+#
+# To pin an EE, add to your ee-requirements.yml:
+#   collections:
+#     - name: nutanix.ncp
+#       version: ">=2.5.0"
+
+collections:
+  # Nutanix Cloud Platform — v2 (v4 API) modules for VM, subnet, and image mgmt
+  - name: nutanix.ncp
+    version: ">=2.5.0"
+
+  # F5 modules — bigip_lx_package used by f5_install_do role
+  - name: f5networks.f5_modules
+    version: ">=1.28.0"
+
+  # ansible.utils — ipaddr filter used in DO declaration template
+  - name: ansible.utils
+    version: ">=3.0.0"
+
+  # ansible.posix — mount module used by image upload role
+  - name: ansible.posix
+    version: ">=1.5.0"

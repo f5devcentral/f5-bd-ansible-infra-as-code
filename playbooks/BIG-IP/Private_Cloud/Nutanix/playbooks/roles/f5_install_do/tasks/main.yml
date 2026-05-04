@@ -1,0 +1,90 @@
+---
+# Role: f5_install_do (Nutanix)
+# Installs the F5 Declarative Onboarding RPM on BIG-IP.
+# RPM sourced from bastion cache (populated by nutanix_image_upload role).
+# Skips installation if DO is already installed on the target BIG-IP.
+# Logic is identical to the OpenShift version — DO install is platform-agnostic.
+
+- name: Check if DO is already installed on {{ node_name }}
+  ansible.builtin.uri:
+    url: "https://{{ hostvars[node_name].f5_mgmt_ip }}/mgmt/shared/declarative-onboarding"
+    method: GET
+    user: admin
+    password: "{{ f5_admin_password }}"
+    validate_certs: false
+    status_code: [200, 404, 422, 500]
+  register: do_check
+  delegate_to: localhost
+
+- name: Set DO install needed fact
+  ansible.builtin.set_fact:
+    do_install_needed: "{{ do_check.status == 404 }}"
+    do_install_success: false
+
+- name: DO install block
+  when:
+    - do_rpm_install_from_cifs | default(false) | bool
+    - do_install_needed
+  block:
+
+    - name: Verify DO RPM exists in bastion cache
+      ansible.builtin.stat:
+        path: "{{ bastion_f5_cache }}/{{ do_filename }}"
+      register: do_rpm_cache_stat
+      delegate_to: bastion01
+      failed_when: not do_rpm_cache_stat.stat.exists
+
+    - name: Wait for iApps LX framework to be ready
+      ansible.builtin.uri:
+        url: "https://{{ hostvars[node_name].f5_mgmt_ip }}/mgmt/shared/iapp/package-management-tasks"
+        method: GET
+        user: admin
+        password: "{{ f5_admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: iapps_ready
+      until: iapps_ready.status == 200
+      retries: 20
+      delay: 30
+      delegate_to: localhost
+      no_log: true
+
+    - name: Set BIG-IP provider facts
+      ansible.builtin.set_fact:
+        bigip_provider:
+          server: "{{ hostvars[node_name].f5_mgmt_ip }}"
+          user: admin
+          password: "{{ f5_admin_password }}"
+          server_port: 443
+          no_f5_teem: true
+          validate_certs: false
+      no_log: true
+
+    - name: Install DO RPM on BIG-IP
+      f5networks.f5_modules.bigip_lx_package:
+        package: "{{ bastion_f5_cache }}/{{ do_filename }}"
+        provider: "{{ bigip_provider }}"
+      delegate_to: bastion01
+
+    - name: Wait for DO endpoint to be available
+      ansible.builtin.uri:
+        url: "https://{{ hostvars[node_name].f5_mgmt_ip }}/mgmt/shared/declarative-onboarding"
+        method: GET
+        user: admin
+        password: "{{ f5_admin_password }}"
+        validate_certs: false
+        status_code: [200]
+      register: do_ready
+      until: do_ready.status == 200
+      retries: 20
+      delay: 15
+      delegate_to: localhost
+      no_log: true
+
+    - name: Confirm DO is installed and ready
+      ansible.builtin.debug:
+        msg: "DO successfully installed on {{ node_name }} ({{ hostvars[node_name].f5_mgmt_ip }})"
+
+    - name: Set DO install success flag
+      ansible.builtin.set_fact:
+        do_install_success: true

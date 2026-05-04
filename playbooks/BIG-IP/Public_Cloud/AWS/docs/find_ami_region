@@ -1,0 +1,19 @@
+aws ec2 describe-images --owners 679593333241 --filters "Name=name,Values=*BIGIP*PAYG*" --region us-east-2
+
+
+aws ec2 describe-images \
+  --region us-east-2 \
+  --owners 679593333241 \
+  --filters "Name=name,Values=*BIGIP*PAYG*" \
+  --query "Images[*].{Name:Name,ImageId:ImageId}" \
+  --output table
+
+
+  ---------------------------------------------------------------
+|                         DescribeImages                      |
++-------------------------------+-----------------------------+
+|  Name                         |  ImageId                    |
++-------------------------------+-----------------------------+
+|  F5 BIG-IP-17.1.1-0.0.4 PAYG  |  ami-0e123abc456def789      |
+|  F5 BIG-IP-16.1.4-0.0.2 PAYG  |  ami-07fa678cde8f4b512      |
+---------------------------------------------------------------

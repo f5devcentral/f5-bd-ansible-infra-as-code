@@ -1,0 +1,22 @@
+---
+# playbooks/03_deploy_vm.yml
+# Renders cloud-init per-node, writes to a temp file on the EE,
+# then creates both VMs via ntnx_vms_v2.
+# Deploys primary first, then secondary.
+
+- name: Phase 3 — Deploy F5 BIG-IP VMs on Nutanix AHV
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Deploy primary node ({{ f5_primary_node }})
+      ansible.builtin.include_role:
+        name: f5_vm_deploy
+      vars:
+        node_name: "{{ f5_primary_node }}"
+
+    - name: Deploy secondary node ({{ f5_secondary_node }})
+      ansible.builtin.include_role:
+        name: f5_vm_deploy
+      vars:
+        node_name: "{{ f5_secondary_node }}"

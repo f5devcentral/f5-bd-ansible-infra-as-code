@@ -1,0 +1,62 @@
+---
+# Role: nutanix_prereqs
+# Validates Prism Central connectivity and confirms the target AHV cluster
+# is visible from this Prism Central instance before any work begins.
+# Uses ntnx_clusters_info_v2 (v4 API) — resolves cluster ext_id and caches
+# it as nutanix_cluster_ext_id for all downstream roles to consume.
+
+# ------------------------------------------------------------------
+# module_defaults — applies nutanix auth to every ncp module in this role
+# ------------------------------------------------------------------
+
+- name: Preflight — test Prism Central connectivity and resolve cluster ext_id
+  block:
+
+    - name: List clusters from Prism Central
+      nutanix.ncp.ntnx_clusters_info_v2:
+        nutanix_host: "{{ nutanix_host }}"
+        nutanix_port: "{{ nutanix_port }}"
+        nutanix_username: "{{ nutanix_username }}"
+        nutanix_password: "{{ nutanix_password }}"
+        validate_certs: "{{ nutanix_validate_certs }}"
+      register: clusters_info
+      no_log: true
+
+    - name: Fail if no clusters returned (PC unreachable or no access)
+      ansible.builtin.fail:
+        msg: |
+          No clusters returned from Prism Central {{ nutanix_host }}.
+          Check nutanix_host, credentials, and network connectivity.
+      when: clusters_info.response | length == 0
+
+    - name: Locate target cluster by name
+      ansible.builtin.set_fact:
+        _matched_clusters: >-
+          {{
+            clusters_info.response |
+            selectattr('name', 'equalto', nutanix_cluster_name) |
+            list
+          }}
+
+    - name: Fail if target cluster not found
+      ansible.builtin.fail:
+        msg: |
+          Cluster '{{ nutanix_cluster_name }}' not found in Prism Central.
+          Update nutanix_cluster_name in extra_vars.
+          Available clusters: {{ clusters_info.response | map(attribute='name') | list }}
+      when: _matched_clusters | length == 0
+
+    - name: Cache cluster ext_id for downstream roles
+      ansible.builtin.set_fact:
+        nutanix_cluster_ext_id: "{{ _matched_clusters[0].ext_id }}"
+        cacheable: true
+
+    - name: Preflight summary
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "Nutanix preflight checks passed"
+          - "Prism Central:  {{ nutanix_host }} ✓"
+          - "Target cluster: {{ nutanix_cluster_name }}"
+          - "Cluster ext_id: {{ nutanix_cluster_ext_id }}"
+          - "================================================"

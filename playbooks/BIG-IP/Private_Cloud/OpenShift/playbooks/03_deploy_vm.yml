@@ -1,0 +1,22 @@
+---
+# playbooks/03_deploy_vm.yml
+# Clones DataVolume per node, creates cloud-init secrets, deploys VMs.
+# Deploys primary first, then secondary — ensures anti-affinity scheduling
+# places them on separate OCP worker nodes.
+
+- name: Deploy F5 BIG-IP VirtualMachines
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Deploy primary node ({{ f5_primary_node }})
+      ansible.builtin.include_role:
+        name: f5_vm_deploy
+      vars:
+        node_name: "{{ f5_primary_node }}"
+
+    - name: Deploy secondary node ({{ f5_secondary_node }})
+      ansible.builtin.include_role:
+        name: f5_vm_deploy
+      vars:
+        node_name: "{{ f5_secondary_node }}"

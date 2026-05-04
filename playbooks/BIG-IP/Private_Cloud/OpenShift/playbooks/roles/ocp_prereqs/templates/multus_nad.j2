@@ -1,0 +1,19 @@
+{# templates/multus_nad.j2 #}
+{# Rendered once per item in f5_networks (excluding mgmt) #}
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: "{{ nad_item.nad_name }}"
+  namespace: "{{ ocp_namespace }}"
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "{{ nad_item.nad_name }}",
+      "type": "ovn-k8s-cni-overlay",
+      "topology": "localnet",
+      "netAttachDefName": "{{ ocp_namespace }}/{{ nad_item.nad_name }}",
+      "vlanID": {{ nad_item.vlan_id }},
+      "mtu": 1500,
+      "ipam": {}
+    }

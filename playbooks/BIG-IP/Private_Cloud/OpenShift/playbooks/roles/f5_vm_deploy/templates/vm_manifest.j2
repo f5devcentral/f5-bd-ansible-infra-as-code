@@ -1,0 +1,62 @@
+{# templates/vm_manifest.j2 #}
+{# Rendered per-node #}
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: "{{ node_name }}"
+  namespace: "{{ ocp_namespace }}"
+  labels:
+    app: f5-bigip
+    role: "{{ 'primary' if node_name == f5_primary_node else 'secondary' }}"
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: "{{ node_name }}"
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/worker: ""
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: f5-bigip
+              topologyKey: kubernetes.io/hostname
+
+      domain:
+        cpu:
+          cores: {{ f5_vm_cpu }}
+        memory:
+          guest: "{{ f5_vm_memory }}"
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+              bootOrder: 1
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+{% for net in f5_networks %}
+            - name: "{{ net.name }}"
+              bridge: {}
+{% endfor %}
+
+      networks:
+{% for net in f5_networks %}
+        - name: "{{ net.name }}"
+          multus:
+            networkName: "{{ ocp_namespace }}/{{ net.nad_name }}"
+{% endfor %}
+
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: "{{ f5_datavolume_name }}-{{ node_name }}"
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            secretRef:
+              name: "cloudinit-{{ node_name }}"

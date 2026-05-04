@@ -1,0 +1,11 @@
+---
+# playbooks/00_nutanix_prereqs.yml
+# Validates Prism Central connectivity, confirms the target AHV cluster
+# exists, and verifies the collection + Python deps are present.
+# Run once before any deployment — safe to re-run (idempotent).
+
+- name: Phase 0 — Nutanix prerequisites and preflight checks
+  hosts: localhost
+  gather_facts: false
+  roles:
+    - role: nutanix_prereqs
